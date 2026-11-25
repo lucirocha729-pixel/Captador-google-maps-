@@ -1,14 +1,17 @@
-import { useRef, useState } from 'react';
-import type { FormEvent } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import type { ChangeEvent, ClipboardEvent, FormEvent } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
   Compass,
+  FileText,
+  Image as ImageIcon,
   Layers,
-  Link2,
   Loader2,
+  Paperclip,
   RefreshCw,
   ShieldCheck,
+  X,
 } from 'lucide-react';
 import { HeaderBar } from './components/HeaderBar';
 import { ScannerViewport3D } from './components/ScannerViewport3D';
@@ -21,27 +24,37 @@ import type {
   ScannerBlueprintResult,
 } from './types/blueprint';
 
-const EXAMPLE_LINKS = [
+interface AttachedMaterial {
+  id: string;
+  file: File;
+  previewUrl: string | null;
+}
+
+const EXAMPLE_INPUTS = [
   {
-    label: 'Site · MASP',
-    url: 'https://masp.org.br/',
+    label: 'CNPJ',
+    value: '60.664.745/0001-87',
   },
   {
-    label: 'CNPJ · Consulta Pública',
-    url: 'https://cnpj.biz/60664745000187',
+    label: 'Nome da Empresa',
+    value: 'Museu de Arte de São Paulo MASP',
   },
   {
-    label: 'Instagram · Empresa',
-    url: 'https://www.instagram.com/masp/',
+    label: 'Texto Copiado do Google',
+    value: `Museu de Arte de São Paulo Assis Chateaubriand\nAv. Paulista, 1578 - Bela Vista, São Paulo - SP, 01310-200\n(11) 3149-5959\nhttps://masp.org.br`,
   },
   {
-    label: 'Google Maps',
-    url: 'https://www.google.com/maps/place/Museu+de+Arte+de+S%C3%A3o+Paulo+Assis+Chateaubriand/@-23.561414,-46.6558819,17z',
+    label: 'Instagram + Site',
+    value: 'https://www.instagram.com/masp/\nhttps://masp.org.br/',
   },
 ];
 
+const MAX_CLIENT_FILES = 5;
+const MAX_CLIENT_FILE_BYTES = 5 * 1024 * 1024;
+
 export default function App() {
-  const [mapsUrl, setMapsUrl] = useState('');
+  const [materialText, setMaterialText] = useState('');
+  const [attachments, setAttachments] = useState<AttachedMaterial[]>([]);
   const [phase, setPhase] = useState<ScannerPhase>('idle');
   const [stageInfo, setStageInfo] = useState<AnalysisStageEvent | null>(null);
   const [errorState, setErrorState] = useState<AnalysisErrorPayload | null>(null);
@@ -50,13 +63,94 @@ export default function App() {
   const [promptCopied, setPromptCopied] = useState(false);
   const [isGeneratingFallback, setIsGeneratingFallback] = useState(false);
 
-  const inputRef = useRef<HTMLInputElement | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
   const resultsAnchorRef = useRef<HTMLDivElement | null>(null);
   const isSubmittingRef = useRef(false);
+  const attachmentsRef = useRef<AttachedMaterial[]>([]);
+
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
+
+  useEffect(() => {
+    return () => {
+      for (const att of attachmentsRef.current) {
+        if (att.previewUrl) URL.revokeObjectURL(att.previewUrl);
+      }
+    };
+  }, []);
 
   const handleFocusScanner = () => {
     window.scrollTo({ top: 0, behavior: 'smooth' });
-    setTimeout(() => inputRef.current?.focus(), 250);
+    setTimeout(() => textareaRef.current?.focus(), 250);
+  };
+
+  const addFiles = (incomingFiles: File[]) => {
+    if (incomingFiles.length === 0) return;
+    setErrorState(null);
+
+    const nextItems: AttachedMaterial[] = [];
+    for (const file of incomingFiles) {
+      if (attachments.length + nextItems.length >= MAX_CLIENT_FILES) {
+        setErrorState({
+          status: 400,
+          code: 'INVALID_INPUT',
+          message: `Limite máximo de ${MAX_CLIENT_FILES} arquivos por identificação.`,
+        });
+        break;
+      }
+      if (file.size > MAX_CLIENT_FILE_BYTES) {
+        setErrorState({
+          status: 400,
+          code: 'INVALID_INPUT',
+          message: `O arquivo "${file.name}" excede o limite de 5 MB.`,
+        });
+        continue;
+      }
+      const isImage = file.type.startsWith('image/');
+      const previewUrl = isImage ? URL.createObjectURL(file) : null;
+      nextItems.push({
+        id: `${file.name}-${file.size}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+        file,
+        previewUrl,
+      });
+    }
+
+    if (nextItems.length > 0) {
+      setAttachments((prev) => [...prev, ...nextItems]);
+    }
+  };
+
+  const handleFileChange = (e: ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files ? Array.from(e.target.files) : [];
+    addFiles(fileList);
+    e.target.value = '';
+  };
+
+  const handleRemoveAttachment = (id: string) => {
+    setAttachments((prev) => {
+      const target = prev.find((item) => item.id === id);
+      if (target?.previewUrl) URL.revokeObjectURL(target.previewUrl);
+      return prev.filter((item) => item.id !== id);
+    });
+  };
+
+  const handlePaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = e.clipboardData?.items;
+    if (!items) return;
+
+    const pastedFiles: File[] = [];
+    for (const item of Array.from(items)) {
+      if (item.kind === 'file') {
+        const f = item.getAsFile();
+        if (f) pastedFiles.push(f);
+      }
+    }
+
+    if (pastedFiles.length > 0) {
+      addFiles(pastedFiles);
+    }
   };
 
   const handleCopyPrompt = async () => {
@@ -109,17 +203,18 @@ export default function App() {
     }
   };
 
-  const runAnalysis = async (targetUrl: string) => {
+  const runAnalysis = async (rawText: string, files: AttachedMaterial[]) => {
     if (isSubmittingRef.current) return;
 
-    const trimmed = targetUrl.trim();
-    if (!trimmed) {
+    const trimmed = rawText.trim();
+    if (!trimmed && files.length === 0) {
       setErrorState({
         status: 400,
         code: 'INVALID_INPUT',
-        message: 'Cole qualquer link público da empresa para iniciar a identificação.',
+        message:
+          'Cole qualquer informação da empresa (CNPJ, nome, endereço, texto do Google, links) ou anexe uma imagem/documento.',
       });
-      inputRef.current?.focus();
+      textareaRef.current?.focus();
       return;
     }
 
@@ -127,16 +222,32 @@ export default function App() {
     setErrorState(null);
     setPhase('scanning');
     setStageInfo({
-      stage: 'Conectando ao núcleo de pesquisa',
-      detail: 'Validando link informado e iniciando identificação em fontes públicas.',
+      stage: 'Recebendo e classificando material',
+      detail:
+        files.length > 0
+          ? `Processando texto e ${files.length} anexo(s) enviado(s) para identificar a empresa.`
+          : 'Extraindo identificadores (CNPJ, nome, telefone, endereço ou links) para pesquisa.',
     });
 
     try {
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: trimmed, mapsUrl: trimmed }),
-      });
+      let response: Response;
+      if (files.length > 0) {
+        const formData = new FormData();
+        formData.append('text', trimmed);
+        for (const item of files) {
+          formData.append('files', item.file);
+        }
+        response = await fetch('/api/analyze', {
+          method: 'POST',
+          body: formData,
+        });
+      } else {
+        response = await fetch('/api/analyze', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text: trimmed }),
+        });
+      }
 
       const contentType = response.headers.get('content-type') || '';
 
@@ -145,7 +256,7 @@ export default function App() {
         setErrorState({
           status: response.status,
           code: response.status === 429 ? 'RATE_LIMITED' : 'INVALID_INPUT',
-          message: errPayload?.error || 'Falha ao iniciar a análise da empresa.',
+          message: errPayload?.error || 'Falha ao iniciar a identificação da empresa.',
         });
         setPhase(result ? 'complete' : 'idle');
         setStageInfo(null);
@@ -207,7 +318,7 @@ export default function App() {
       }
 
       if (!receivedResult) {
-        throw new Error('A análise terminou sem retornar o projeto arquitetônico.');
+        throw new Error('A identificação terminou sem retornar o projeto arquitetônico.');
       }
 
       setResult(receivedResult);
@@ -225,7 +336,7 @@ export default function App() {
       setErrorState({
         status: 500,
         code: 'UPSTREAM_ERROR',
-        message: err instanceof Error ? err.message : 'Erro inesperado ao analisar o link.',
+        message: err instanceof Error ? err.message : 'Erro inesperado ao identificar a empresa.',
         collectedData: preservedData ?? undefined,
       });
     } finally {
@@ -235,7 +346,7 @@ export default function App() {
 
   const handleSubmit = (e: FormEvent) => {
     e.preventDefault();
-    void runAnalysis(mapsUrl);
+    void runAnalysis(materialText, attachments);
   };
 
   return (
@@ -254,57 +365,113 @@ export default function App() {
           className="relative overflow-hidden border-b border-slate-800/70 bg-[radial-gradient(ellipse_at_top,rgba(14,116,144,0.16),transparent_60%)]"
         >
           <div className="mx-auto grid max-w-7xl items-stretch gap-10 px-6 py-12 lg:grid-cols-12 lg:py-16">
-            {/* Left Column: Single Input & Action */}
-            <div className="flex flex-col justify-center space-y-7 lg:col-span-7">
+            {/* Left Column: Universal Multimodal Identification Input */}
+            <div className="flex flex-col justify-center space-y-6 lg:col-span-7">
               <div className="space-y-4">
                 <p className="text-xs font-medium tracking-wider text-cyan-300">
-                  Identificação Universal · Arquitetura 3D · Prompt Final de Construção
+                  Motor de Identificação Universal · OCR · CNPJ · Arquitetura 3D
                 </p>
                 <h1 className="font-display text-4xl font-extrabold tracking-tight text-white [text-wrap:balance] sm:text-5xl">
-                  COLE QUALQUER LINK DA EMPRESA
+                  VAMOS ENCONTRAR SUA EMPRESA
                 </h1>
                 <p className="max-w-2xl text-base leading-relaxed text-slate-300">
-                  Instagram, Facebook, CNPJ, site, Google Maps ou qualquer outra página pública. O VIRA SCANNER 3D cruza fontes públicas reais, projeta os 11 pilares de UI/UX 3D e gera o prompt único pronto para construção.
+                  Cole qualquer informação, envie uma imagem ou digite o CNPJ, nome ou endereço. Nossa inteligência identifica sua empresa.
                 </p>
               </div>
 
               <form onSubmit={handleSubmit} className="space-y-4">
-                <label htmlFor="company-link-input" className="sr-only">
-                  Cole qualquer link da empresa
+                <label htmlFor="company-material-input" className="sr-only">
+                  Cole informações, links, CNPJ, nome ou endereço da empresa
                 </label>
 
-                <div className="input-3d-recessed flex flex-col gap-3 rounded-3xl p-2.5 sm:flex-row sm:items-center">
-                  <div className="flex flex-1 items-center gap-3 px-3">
-                    <Link2 className="h-5 w-5 shrink-0 text-cyan-400" />
-                    <input
-                      id="company-link-input"
-                      ref={inputRef}
-                      type="url"
-                      value={mapsUrl}
-                      onChange={(e) => setMapsUrl(e.target.value)}
-                      placeholder="Instagram, Facebook, CNPJ, site, Google Maps ou outra página pública..."
-                      disabled={phase === 'scanning'}
-                      className="w-full bg-transparent py-2.5 text-sm text-white placeholder:text-slate-500 focus:outline-none disabled:opacity-60"
-                    />
-                  </div>
-
-                  <button
-                    type="submit"
+                <div className="input-3d-recessed rounded-3xl p-4 space-y-3">
+                  <textarea
+                    id="company-material-input"
+                    ref={textareaRef}
+                    rows={4}
+                    value={materialText}
+                    onChange={(e) => setMaterialText(e.target.value)}
+                    onPaste={handlePaste}
+                    placeholder="Cole texto do Google ou Instagram, CNPJ, razão social, nome fantasia, endereço, telefone, múltiplos links ou cole uma captura de tela (Ctrl+V)..."
                     disabled={phase === 'scanning'}
-                    className="btn-3d-neon inline-flex cursor-pointer items-center justify-center gap-2 rounded-full px-7 py-3.5 text-xs font-extrabold tracking-wider whitespace-nowrap shrink-0 disabled:cursor-not-allowed disabled:opacity-65 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300"
-                  >
-                    {phase === 'scanning' ? (
-                      <>
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                        <span>IDENTIFICANDO...</span>
-                      </>
-                    ) : (
-                      <>
-                        <span>IDENTIFICAR EMPRESA</span>
-                        <ArrowRight className="h-4 w-4" />
-                      </>
-                    )}
-                  </button>
+                    className="w-full resize-y bg-transparent text-sm leading-relaxed text-white placeholder:text-slate-500 focus:outline-none disabled:opacity-60"
+                  />
+
+                  {attachments.length > 0 && (
+                    <div className="flex flex-wrap gap-2 border-t border-slate-800/80 pt-3">
+                      {attachments.map((item) => (
+                        <div
+                          key={item.id}
+                          className="flex items-center gap-2 rounded-2xl border border-slate-700/80 bg-slate-900/90 px-3 py-1.5 text-xs text-slate-200"
+                        >
+                          {item.previewUrl ? (
+                            <img
+                              src={item.previewUrl}
+                              alt={item.file.name}
+                              className="h-6 w-6 rounded-lg object-cover border border-white/10"
+                            />
+                          ) : item.file.type.startsWith('image/') ? (
+                            <ImageIcon className="h-4 w-4 text-cyan-300" />
+                          ) : (
+                            <FileText className="h-4 w-4 text-cyan-300" />
+                          )}
+                          <span className="max-w-[160px] truncate">{item.file.name}</span>
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveAttachment(item.id)}
+                            disabled={phase === 'scanning'}
+                            aria-label={`Remover ${item.file.name}`}
+                            className="cursor-pointer rounded-full p-0.5 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-40"
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/70 pt-3">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <input
+                        ref={fileInputRef}
+                        type="file"
+                        multiple
+                        accept="image/png,image/jpeg,image/webp,image/gif,.pdf,.txt,.csv,.json,.md"
+                        onChange={handleFileChange}
+                        className="sr-only"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => fileInputRef.current?.click()}
+                        disabled={phase === 'scanning'}
+                        className="btn-3d-secondary inline-flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs font-semibold text-slate-200 whitespace-nowrap disabled:opacity-55"
+                      >
+                        <Paperclip className="h-3.5 w-3.5 text-cyan-300" />
+                        <span>Anexar Imagem ou Documento</span>
+                      </button>
+                      <span className="text-[11px] text-slate-500">
+                        Imagens (OCR), PDF, TXT · até 5 MB
+                      </span>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={phase === 'scanning'}
+                      className="btn-3d-neon inline-flex cursor-pointer items-center justify-center gap-2 rounded-full px-7 py-3 text-xs font-extrabold tracking-wider whitespace-nowrap shrink-0 disabled:cursor-not-allowed disabled:opacity-65 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300"
+                    >
+                      {phase === 'scanning' ? (
+                        <>
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                          <span>IDENTIFICANDO...</span>
+                        </>
+                      ) : (
+                        <>
+                          <span>IDENTIFICAR EMPRESA</span>
+                          <ArrowRight className="h-4 w-4" />
+                        </>
+                      )}
+                    </button>
+                  </div>
                 </div>
 
                 {/* Live SSE stage progress during scanning */}
@@ -342,7 +509,7 @@ export default function App() {
                         <p className="font-semibold">
                           {errorState.code === 'RATE_LIMITED'
                             ? 'Limite de requisições da API Gemini (429 RESOURCE_EXHAUSTED)'
-                            : 'Aviso na análise do link'}
+                            : 'Aviso na identificação'}
                         </p>
                         <p className="text-xs leading-relaxed opacity-90">{errorState.message}</p>
                       </div>
@@ -355,7 +522,7 @@ export default function App() {
                         </p>
                         <p>
                           <strong className="text-white">Estabelecimento:</strong>{' '}
-                          {preservedData.placeName || preservedData.legalName || 'Identificado apenas pela URL'}
+                          {preservedData.placeName || preservedData.legalName || preservedData.inputSummary || 'Identificado'}
                         </p>
                         {preservedData.cnpj && (
                           <p className="font-mono tabular-nums">
@@ -385,7 +552,7 @@ export default function App() {
                     <div className="flex flex-wrap items-center gap-3">
                       <button
                         type="button"
-                        onClick={() => void runAnalysis(mapsUrl)}
+                        onClick={() => void runAnalysis(materialText, attachments)}
                         disabled={phase === 'scanning' || isGeneratingFallback}
                         className="btn-3d-secondary inline-flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs font-semibold text-white whitespace-nowrap"
                       >
@@ -414,14 +581,14 @@ export default function App() {
 
                 {/* Quick functional test buttons */}
                 <div className="flex flex-wrap items-center gap-2 pt-1">
-                  <span className="text-xs text-slate-500">Testar com exemplo real:</span>
-                  {EXAMPLE_LINKS.map((example) => (
+                  <span className="text-xs text-slate-500">Testar entrada:</span>
+                  {EXAMPLE_INPUTS.map((example) => (
                     <button
                       key={example.label}
                       type="button"
                       disabled={phase === 'scanning'}
                       onClick={() => {
-                        setMapsUrl(example.url);
+                        setMaterialText(example.value);
                         setErrorState(null);
                       }}
                       className="cursor-pointer rounded-full border border-slate-800 bg-slate-900/75 px-3.5 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:border-cyan-400/50 hover:text-cyan-200 disabled:opacity-50 whitespace-nowrap"
@@ -436,7 +603,7 @@ export default function App() {
                 <div className="flex items-start gap-2.5">
                   <Compass className="mt-0.5 h-4 w-4 shrink-0 text-cyan-400" />
                   <span>
-                    Fontes públicas reais com declaração explícita de limitações quando um dado não é localizado.
+                    Identifica por CNPJ, nome, endereço, texto copiado, captura de tela (OCR) ou múltiplos links, cruzando fontes públicas reais.
                   </span>
                 </div>
                 <div className="flex items-start gap-2.5">

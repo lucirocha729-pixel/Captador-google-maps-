@@ -131,6 +131,10 @@ export interface CollectedResearchData {
   originalInputUrl: string;
   resolvedMapsUrl: string;
   sourceOrigin?: string;
+  inputSummary?: string;
+  ocrText?: string | null;
+  extractedUrls?: string[];
+  maskedCpf?: string | null;
   placeName: string | null;
   legalName?: string | null;
   cnpj?: string | null;
@@ -166,5 +170,6 @@ export interface AnalysisErrorPayload {
   message: string;
   collectedData?: CollectedResearchData;
 }
+
 
 

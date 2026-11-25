@@ -4,6 +4,10 @@ import type {
   VerificationStatus,
   VerifiedSource,
 } from '../src/types/blueprint.ts';
+import {
+  interpretBusinessMaterial,
+  type InterpretedInput,
+} from './inputInterpreter.ts';
 
 export type SourceOrigin =
   | 'instagram'
@@ -826,6 +830,44 @@ async function lookupCnpjPublicData(cnpjDigits: string): Promise<CnpjRecord | nu
     };
   }
 
+  // 3. Fallback: minhareceita.org
+  const minhaReceita = await tryFetchJson(`https://minhareceita.org/${clean}`);
+  if (minhaReceita && typeof minhaReceita.razao_social === 'string') {
+    const addrParts = [
+      [minhaReceita.descricao_tipo_de_logradouro, minhaReceita.logradouro].filter(Boolean).join(' '),
+      minhaReceita.numero,
+      minhaReceita.complemento,
+      minhaReceita.bairro,
+      [minhaReceita.municipio, minhaReceita.uf].filter(Boolean).join('/'),
+      minhaReceita.cep ? `CEP ${minhaReceita.cep}` : null,
+    ].filter((x): x is string => typeof x === 'string' && x.trim().length > 0);
+
+    return {
+      cnpj: formatCnpj(clean),
+      legalName: minhaReceita.razao_social.trim(),
+      tradeName:
+        typeof minhaReceita.nome_fantasia === 'string' && minhaReceita.nome_fantasia.trim()
+          ? minhaReceita.nome_fantasia.trim()
+          : null,
+      address: addrParts.join(', ') || null,
+      cityState:
+        minhaReceita.municipio && minhaReceita.uf
+          ? `${String(minhaReceita.municipio).trim()} - ${String(minhaReceita.uf).trim()}`
+          : null,
+      phone:
+        typeof minhaReceita.ddd_telefone_1 === 'string' && minhaReceita.ddd_telefone_1.trim()
+          ? minhaReceita.ddd_telefone_1.trim()
+          : null,
+      email: typeof minhaReceita.email === 'string' && minhaReceita.email.trim() ? minhaReceita.email.trim() : null,
+      segment:
+        typeof minhaReceita.cnae_fiscal_descricao === 'string' && minhaReceita.cnae_fiscal_descricao.trim()
+          ? minhaReceita.cnae_fiscal_descricao.trim()
+          : null,
+      sourceTitle: `Minha Receita (${formatCnpj(clean)})`,
+      sourceUrl: `https://minhareceita.org/${clean}`,
+    };
+  }
+
   return null;
 }
 
@@ -949,11 +991,18 @@ async function searchPublicWeb(query: string): Promise<WebSearchHit[]> {
   }
 }
 
+function last8Digits(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const digits = raw.replace(/\D/g, '');
+  return digits.length >= 8 ? digits.slice(-8) : digits;
+}
+
 function evaluateIdentityMatch(
   anchor: {
     nameTokens: string[];
     cnpj: string | null;
     cityTokens: string[];
+    phoneLast8: string[];
     domain: string | null;
     handle: string | null;
   },
@@ -977,9 +1026,15 @@ function evaluateIdentityMatch(
     return 'confirmed';
   }
 
+  // Phone tail verification across sources
+  const candDigitsOnly = candidateText.replace(/\D/g, '');
+  const phoneMatched =
+    anchor.phoneLast8.length > 0 &&
+    anchor.phoneLast8.some((tail) => tail.length === 8 && candDigitsOnly.includes(tail));
+
   const candTokens = tokenizeName(candidateText);
   if (anchor.nameTokens.length === 0 || candTokens.length === 0) {
-    return 'unconfirmed';
+    return phoneMatched ? 'confirmed' : 'unconfirmed';
   }
 
   const candSet = new Set(candTokens);
@@ -992,6 +1047,10 @@ function evaluateIdentityMatch(
   const cityMatched =
     anchor.cityTokens.length > 0 && anchor.cityTokens.some((ct) => candSet.has(ct));
 
+  // Protect against homonyms: if candidate explicitly mentions another major Brazilian state/city mismatching anchor
+  if (phoneMatched && overlap >= 0.35) {
+    return 'confirmed';
+  }
   if (overlap >= 0.7 && (cityMatched || anchor.nameTokens.length >= 2)) {
     return 'confirmed';
   }
@@ -1024,23 +1083,36 @@ function isPlatformAggregator(domain: string): boolean {
     'guiamais.com.br',
     'apontador.com.br',
     'telelistas.net',
+    'solutudo.com.br',
     'wikipedia.org',
+    'wikidata.org',
+    'baidu.com',
+    'quora.com',
+    'reddit.com',
+    'tripadvisor.com',
+    'tripadvisor.com.br',
+    'yelp.com',
+    'yelp.com.br',
     'youtube.com',
+    'tiktok.com',
+    'twitter.com',
+    'x.com',
+    'pinterest.com',
+    'britannica.com',
+    'fandom.com',
+    'globo.com',
+    'uol.com.br',
+    'folha.uol.com.br',
+    'estadao.com.br',
   ].some((agg) => lower === agg || lower.endsWith(`.${agg}`));
 }
 
-export async function runUniversalCompanyResearch(
-  rawInputUrl: string,
+export async function runUniversalCompanyResearchFromMaterial(
+  interpreted: InterpretedInput,
   onProgress?: (stage: string, detail: string) => void
 ): Promise<CollectedResearchData> {
-  const trimmed = rawInputUrl.trim();
-  const parsed = new URL(trimmed);
-  if ((parsed.protocol !== 'https:' && parsed.protocol !== 'http:') || isPrivateOrBlockedHost(parsed.hostname)) {
-    throw new Error('Endereço de URL inválido ou não permitido.');
-  }
-
-  const limitations: string[] = [];
-  const researchNotes: string[] = [];
+  const limitations: string[] = [...interpreted.limitations];
+  const researchNotes: string[] = [...interpreted.interpretationNotes];
   const verifiedSources: VerifiedSource[] = [];
   const seenUrls = new Set<string>();
 
@@ -1055,15 +1127,6 @@ export async function runUniversalCompanyResearch(
     verifiedSources.push({ title: title.trim() || clean, url: clean, sourceType });
   };
 
-  onProgress?.(
-    'Analisando link informado',
-    'Identificando domínio, plataforma de origem e parâmetros públicos.'
-  );
-
-  const primaryFetch = await safeFetchPublicHtml(trimmed);
-  const resolvedUrl = primaryFetch.resolvedUrl || trimmed;
-  const classification = classifySourceUrl(resolvedUrl);
-
   const originLabelMap: Record<SourceOrigin, string> = {
     instagram: 'Instagram',
     facebook: 'Facebook',
@@ -1075,113 +1138,275 @@ export async function runUniversalCompanyResearch(
     website: 'Site Institucional',
   };
 
-  addSource(
-    `${originLabelMap[classification.origin]} (Link informado)`,
-    resolvedUrl,
-    classification.origin === 'google_maps'
-      ? 'google_maps'
-      : classification.origin === 'website'
-        ? 'official_site'
-        : classification.origin === 'instagram' ||
-            classification.origin === 'facebook' ||
-            classification.origin === 'linkedin'
-          ? 'social'
-          : 'web'
-  );
+  // Seed initial state from interpreted multimodal material (marked unconfirmed until cross-validated)
+  let primaryName: string | null = interpreted.businessName || null;
+  let legalName: string | null = interpreted.legalName || null;
+  let cnpjDigits: string | null = interpreted.cnpjs[0] || null;
+  let address: string | null = interpreted.addresses[0] || null;
+  let cityState: string | null = interpreted.cityStates[0] || null;
+  let phone: string | null = interpreted.phones[0] || null;
+  let whatsapp: string | null = interpreted.whatsapps[0] || null;
+  let email: string | null = interpreted.emails[0] || null;
+  let hours: string | null = interpreted.hours || null;
+  let segment: string | null = interpreted.segmentHint || null;
 
-  if (!primaryFetch.ok) {
-    if (primaryFetch.blocked) {
-      limitations.push(
-        `A página informada (${originLabelMap[classification.origin]}) restringiu leitura direta automatizada (${primaryFetch.error || 'login/bloqueio'}); pesquisa continuada por identificadores e fontes públicas complementares.`
+  let website: string | null = null;
+  let instagram: string | null =
+    interpreted.instagramHandles[0]
+      ? `https://www.instagram.com/${interpreted.instagramHandles[0]}/`
+      : null;
+  let facebook: string | null = null;
+  let linkedin: string | null = null;
+  let googleMapsUrl: string | null = null;
+  let primaryDomain: string | null = null;
+  let primaryHandle: string | null = interpreted.instagramHandles[0] || null;
+  let primaryOriginLabel = interpreted.ocrText
+    ? 'Leitura de Imagem (OCR)'
+    : interpreted.documentText
+      ? 'Documento Empresarial'
+      : interpreted.cnpjs.length > 0 && interpreted.urls.length === 0
+        ? 'CNPJ Informado'
+        : interpreted.urls.length > 0
+          ? 'Múltiplas Fontes / Links'
+          : 'Identificação Textual';
+
+  let metaTitle: string | null = null;
+  let metaDescription: string | null = null;
+  let latLng: { latitude: number; longitude: number } | null = null;
+  let queryHint: string | null = interpreted.businessName || null;
+  const productsAndServices: string[] = [];
+
+  const fieldStatuses: Record<string, VerificationStatus> = {
+    name: primaryName ? 'unconfirmed' : 'not_found',
+    legalName: legalName ? 'unconfirmed' : 'not_found',
+    cnpj: cnpjDigits ? 'unconfirmed' : 'not_found',
+    address: address ? 'unconfirmed' : 'not_found',
+    phone: phone ? 'unconfirmed' : 'not_found',
+    whatsapp: whatsapp ? 'unconfirmed' : 'not_found',
+    website: 'not_found',
+    instagram: instagram ? 'unconfirmed' : 'not_found',
+    facebook: 'not_found',
+    googleMapsUrl: 'not_found',
+    hours: hours ? 'unconfirmed' : 'not_found',
+  };
+
+  // Stage 4a: Inspect extracted URLs (supports 0, 1, or multiple URLs)
+  const inspectedPages = new Set<string>();
+  if (interpreted.urls.length > 0) {
+    onProgress?.(
+      'Analisando links detectados no material',
+      `Validando ${interpreted.urls.length} endereço(s) público(s) e extraindo metadados.`
+    );
+
+    for (let i = 0; i < Math.min(interpreted.urls.length, 3); i++) {
+      const candidateUrl = interpreted.urls[i];
+      const safeUrl = normalizeHttpUrl(candidateUrl);
+      if (!safeUrl) continue;
+
+      let parsedCandidate: URL;
+      try {
+        parsedCandidate = new URL(safeUrl);
+        if (isPrivateOrBlockedHost(parsedCandidate.hostname)) continue;
+      } catch {
+        continue;
+      }
+
+      const fetchRes = await safeFetchPublicHtml(safeUrl);
+      const resolvedUrl = fetchRes.resolvedUrl || safeUrl;
+      inspectedPages.add(resolvedUrl);
+
+      const classification = classifySourceUrl(resolvedUrl);
+      if (i === 0) {
+        primaryOriginLabel = originLabelMap[classification.origin];
+        if (classification.mapsCoords) latLng = classification.mapsCoords;
+        if (classification.mapsQueryHint || classification.slugHint) {
+          queryHint = classification.mapsQueryHint || classification.slugHint;
+        }
+      }
+
+      addSource(
+        `${originLabelMap[classification.origin]} (Informado)`,
+        resolvedUrl,
+        classification.origin === 'google_maps'
+          ? 'google_maps'
+          : classification.origin === 'website'
+            ? 'official_site'
+            : classification.origin === 'instagram' ||
+                classification.origin === 'facebook' ||
+                classification.origin === 'linkedin'
+              ? 'social'
+              : 'web'
       );
-    } else {
-      limitations.push(
-        `A página informada retornou indisponibilidade (${primaryFetch.error || 'sem resposta'}); pesquisa continuada em outras fontes públicas.`
-      );
+
+      if (classification.origin === 'website' && !primaryDomain) {
+        primaryDomain = classification.domain;
+      }
+      if ((classification.instagramHandle || classification.facebookSlug || classification.linkedinSlug) && !primaryHandle) {
+        primaryHandle = classification.instagramHandle || classification.facebookSlug || classification.linkedinSlug;
+      }
+
+      if (classification.origin === 'website' && !website) {
+        website = parsedCandidate.origin;
+        fieldStatuses.website = fetchRes.ok ? 'confirmed' : 'unconfirmed';
+      } else if (classification.origin === 'instagram' && !instagram) {
+        instagram = resolvedUrl.split('?')[0];
+        fieldStatuses.instagram = 'confirmed';
+      } else if (classification.origin === 'facebook' && !facebook) {
+        facebook = resolvedUrl.split('?')[0];
+        fieldStatuses.facebook = 'confirmed';
+      } else if (classification.origin === 'linkedin' && !linkedin) {
+        linkedin = resolvedUrl.split('?')[0];
+      } else if (classification.origin === 'google_maps' && !googleMapsUrl) {
+        googleMapsUrl = resolvedUrl;
+        fieldStatuses.googleMapsUrl = 'confirmed';
+      }
+
+      if (!fetchRes.ok) {
+        if (fetchRes.blocked) {
+          limitations.push(
+            `A página ${originLabelMap[classification.origin]} (${parsedCandidate.hostname}) restringiu leitura automatizada (${fetchRes.error || 'login/bloqueio'}); continuando pesquisa em fontes complementares.`
+          );
+        } else {
+          limitations.push(
+            `A página ${parsedCandidate.hostname} retornou indisponibilidade (${fetchRes.error || 'sem resposta'}); continuando por fontes públicas complementares.`
+          );
+        }
+      }
+
+      const facts = fetchRes.ok ? extractFromHtml(fetchRes.html, resolvedUrl) : extractFromHtml('', resolvedUrl);
+
+      // Guard against mixing unrelated companies if multiple URLs were provided
+      if (i > 0 && primaryName) {
+        const secondaryCheck = evaluateIdentityMatch(
+          {
+            nameTokens: tokenizeName(primaryName),
+            cnpj: cnpjDigits,
+            cityTokens: tokenizeName(cityState),
+            phoneLast8: [phone, whatsapp].map(last8Digits).filter(Boolean),
+            domain: primaryDomain,
+            handle: primaryHandle,
+          },
+          `${facts.businessName || ''} ${facts.legalName || ''} ${facts.metaDescription || ''}`,
+          resolvedUrl,
+          classification.cnpjFromUrl || facts.cnpjs[0] || null
+        );
+        if (secondaryCheck === 'rejected') {
+          limitations.push(
+            `Um link adicional (${parsedCandidate.hostname}) parece apontar para outra entidade e não foi mesclado para evitar mistura de dados.`
+          );
+          continue;
+        }
+      }
+
+      if (facts.metaTitle && !metaTitle) metaTitle = facts.metaTitle;
+      if (facts.title && !metaTitle) metaTitle = facts.title;
+      if (facts.metaDescription && !metaDescription) metaDescription = facts.metaDescription;
+
+      const nameFromUrl = facts.businessName || classification.mapsPlaceName || classification.mapsQueryHint;
+      if (nameFromUrl && (!primaryName || fieldStatuses.name !== 'confirmed')) {
+        primaryName = nameFromUrl;
+        fieldStatuses.name = facts.businessName || classification.mapsPlaceName ? 'confirmed' : 'unconfirmed';
+      } else if (!primaryName && classification.slugHint) {
+        primaryName = classification.slugHint;
+        fieldStatuses.name = 'unconfirmed';
+      }
+
+      if (facts.legalName && !legalName) {
+        legalName = facts.legalName;
+        fieldStatuses.legalName = 'confirmed';
+      }
+
+      const foundCnpj = classification.cnpjFromUrl || facts.cnpjs[0] || null;
+      if (foundCnpj && !cnpjDigits) {
+        cnpjDigits = foundCnpj;
+        fieldStatuses.cnpj = 'confirmed';
+      }
+
+      if (facts.address && (!address || fieldStatuses.address !== 'confirmed')) {
+        address = facts.address;
+        fieldStatuses.address = 'confirmed';
+      }
+      if (facts.cityState && !cityState) cityState = facts.cityState;
+      if (facts.phones[0] && (!phone || fieldStatuses.phone !== 'confirmed')) {
+        phone = facts.phones[0];
+        fieldStatuses.phone = 'confirmed';
+      }
+      if (facts.whatsapps[0] && !whatsapp) {
+        whatsapp = facts.whatsapps[0];
+        fieldStatuses.whatsapp = 'confirmed';
+      }
+      if (facts.emails[0] && !email) email = facts.emails[0];
+      if (facts.hours && !hours) {
+        hours = facts.hours;
+        fieldStatuses.hours = 'confirmed';
+      }
+      if (facts.segment && !segment) segment = facts.segment;
+      if (facts.instagrams[0] && !instagram) {
+        instagram = facts.instagrams[0];
+        fieldStatuses.instagram = 'confirmed';
+      }
+      if (facts.facebooks[0] && !facebook) {
+        facebook = facts.facebooks[0];
+        fieldStatuses.facebook = 'confirmed';
+      }
+      if (facts.linkedins[0] && !linkedin) linkedin = facts.linkedins[0];
+      if (facts.googleMapsUrls[0] && !googleMapsUrl) {
+        googleMapsUrl = facts.googleMapsUrls[0];
+        fieldStatuses.googleMapsUrl = 'confirmed';
+      }
+      if (facts.externalWebsites[0] && !website) {
+        website = facts.externalWebsites[0];
+        fieldStatuses.website = 'confirmed';
+      }
     }
   }
 
-  const primaryFacts = primaryFetch.ok
-    ? extractFromHtml(primaryFetch.html, resolvedUrl)
-    : extractFromHtml('', resolvedUrl);
-
-  let primaryName =
-    primaryFacts.businessName ||
-    classification.mapsPlaceName ||
-    classification.mapsQueryHint ||
-    classification.slugHint ||
-    null;
-
-  let legalName: string | null = primaryFacts.legalName || null;
-  let cnpjDigits: string | null = classification.cnpjFromUrl || primaryFacts.cnpjs[0] || null;
-  let address: string | null = primaryFacts.address || null;
-  let cityState: string | null = primaryFacts.cityState || null;
-  let phone: string | null = primaryFacts.phones[0] || null;
-  let whatsapp: string | null = primaryFacts.whatsapps[0] || null;
-  let email: string | null = primaryFacts.emails[0] || null;
-  const hours: string | null = primaryFacts.hours || null;
-  let segment: string | null = primaryFacts.segment || null;
-
-  let website: string | null =
-    classification.origin === 'website'
-      ? `${new URL(resolvedUrl).origin}`
-      : primaryFacts.externalWebsites[0] || null;
-  let instagram: string | null =
-    classification.origin === 'instagram'
-      ? resolvedUrl.split('?')[0]
-      : primaryFacts.instagrams[0] || null;
-  let facebook: string | null =
-    classification.origin === 'facebook'
-      ? resolvedUrl.split('?')[0]
-      : primaryFacts.facebooks[0] || null;
-  let linkedin: string | null =
-    classification.origin === 'linkedin'
-      ? resolvedUrl.split('?')[0]
-      : primaryFacts.linkedins[0] || null;
-  let googleMapsUrl: string | null =
-    classification.origin === 'google_maps'
-      ? resolvedUrl
-      : primaryFacts.googleMapsUrls[0] || null;
-
-  const fieldStatuses: Record<string, VerificationStatus> = {
-    name: primaryName ? (primaryFacts.businessName || classification.mapsPlaceName ? 'confirmed' : 'unconfirmed') : 'not_found',
-    legalName: legalName ? 'confirmed' : 'not_found',
-    cnpj: cnpjDigits ? 'confirmed' : 'not_found',
-    address: address ? 'confirmed' : 'not_found',
-    phone: phone ? 'confirmed' : 'not_found',
-    whatsapp: whatsapp ? 'confirmed' : 'not_found',
-    website: website ? (classification.origin === 'website' && !primaryFetch.ok ? 'unconfirmed' : 'confirmed') : 'not_found',
-    instagram: instagram ? 'confirmed' : 'not_found',
-    facebook: facebook ? 'confirmed' : 'not_found',
-    googleMapsUrl: googleMapsUrl ? 'confirmed' : 'not_found',
-    hours: hours ? 'confirmed' : 'not_found',
-  };
-
-  // Step 4: If CNPJ already discovered, query BrasilAPI / CNPJ.ws immediately
+  // Stage 4b: If CNPJ is known, query BrasilAPI / CNPJ.ws / MinhaReceita and check for input contradictions
   if (cnpjDigits) {
     onProgress?.(
-      'Consultando base pública de CNPJ',
-      `Validando dados oficiais para o CNPJ ${formatCnpj(cnpjDigits)}.`
+      'Consultando bases oficiais de CNPJ',
+      `Validando dados cadastrais para CNPJ ${formatCnpj(cnpjDigits)}.`
     );
     const cnpjRecord = await lookupCnpjPublicData(cnpjDigits);
     if (cnpjRecord) {
       addSource(cnpjRecord.sourceTitle, cnpjRecord.sourceUrl, 'cnpj_api');
+
+      // Detect conflict if user typed a company name completely contradictory to the official CNPJ
+      if (interpreted.businessName) {
+        const userTokens = tokenizeName(interpreted.businessName);
+        const officialTokens = new Set([
+          ...tokenizeName(cnpjRecord.legalName),
+          ...tokenizeName(cnpjRecord.tradeName),
+        ]);
+        const overlapCount = userTokens.filter((t) => officialTokens.has(t)).length;
+        if (userTokens.length >= 2 && overlapCount === 0) {
+          limitations.push(
+            `Divergência detectada no material enviado: o nome informado ("${interpreted.businessName}") não coincide com o titular oficial do CNPJ ${cnpjRecord.cnpj} ("${cnpjRecord.tradeName || cnpjRecord.legalName}"). Priorizando o registro oficial para evitar mistura de empresas.`
+          );
+          // Reject conflicting user-entered contact hints so we don't blend two businesses
+          if (interpreted.addresses[0] && address === interpreted.addresses[0]) address = null;
+          if (interpreted.phones[0] && phone === interpreted.phones[0]) phone = null;
+        }
+      }
+
       legalName = cnpjRecord.legalName;
       fieldStatuses.legalName = 'confirmed';
       fieldStatuses.cnpj = 'confirmed';
+
       if (cnpjRecord.tradeName) {
         primaryName = cnpjRecord.tradeName;
         fieldStatuses.name = 'confirmed';
-      } else if (!primaryName) {
+      } else if (!primaryName || fieldStatuses.name !== 'confirmed') {
         primaryName = cnpjRecord.legalName;
         fieldStatuses.name = 'confirmed';
       }
+
       if (cnpjRecord.address) {
         address = cnpjRecord.address;
         fieldStatuses.address = 'confirmed';
       }
       if (cnpjRecord.cityState) cityState = cnpjRecord.cityState;
-      if (cnpjRecord.phone && !phone) {
+      if (cnpjRecord.phone && (!phone || fieldStatuses.phone !== 'confirmed')) {
         phone = cnpjRecord.phone;
         fieldStatuses.phone = 'confirmed';
       }
@@ -1189,45 +1414,61 @@ export async function runUniversalCompanyResearch(
       if (cnpjRecord.segment) segment = cnpjRecord.segment;
     } else {
       limitations.push(
-        `Consulta automática à base pública para o CNPJ ${formatCnpj(cnpjDigits)} não retornou dados completos.`
+        `Consulta automática às bases públicas para o CNPJ ${formatCnpj(cnpjDigits)} não retornou dados cadastrais completos no momento.`
       );
     }
   }
 
-  // Step 5: Complementary Public Web Search to enrich missing data & cross-validate
-  const searchSubject = primaryName || legalName || classification.slugHint;
+  // Stage 5: Complementary Multi-Source Web Search (works with 0 URLs, CNPJ-only, name-only, phone, handle, etc.)
+  const searchSubject =
+    primaryName ||
+    legalName ||
+    primaryHandle ||
+    interpreted.addresses[0] ||
+    interpreted.phones[0] ||
+    (cnpjDigits ? formatCnpj(cnpjDigits) : null);
   if (searchSubject) {
     onProgress?.(
-      'Pesquisando fontes públicas complementares',
-      `Cruzando presença digital, site oficial, CNPJ e contatos para "${searchSubject}".`
+      'Pesquisando e cruzando fontes públicas na web',
+      `Buscando presença digital, site oficial, CNPJ e contatos para "${searchSubject}".`
     );
 
     const anchor = {
-      nameTokens: tokenizeName(searchSubject),
+      nameTokens: tokenizeName(primaryName || legalName || ''),
       cnpj: cnpjDigits,
       cityTokens: tokenizeName(cityState),
-      domain: classification.origin === 'website' ? classification.domain : null,
-      handle: classification.instagramHandle || classification.facebookSlug || classification.linkedinSlug,
+      phoneLast8: [phone, whatsapp, ...interpreted.phones].map(last8Digits).filter(Boolean),
+      domain: primaryDomain,
+      handle: primaryHandle,
     };
 
     const queries: string[] = [];
-    const cityPart = cityState ? ` ${cityState.split('-')[0].trim()}` : '';
-    const dashParts = searchSubject.split(/\s+-\s+/).map((p) => p.trim()).filter(Boolean);
-    const shortQuery =
-      dashParts.length > 1 && dashParts[dashParts.length - 1].length <= 20
-        ? dashParts[dashParts.length - 1]
-        : searchSubject.split(/\s+/).slice(0, 5).join(' ');
-    queries.push(`${shortQuery}${cityPart}`);
-    if (!cnpjDigits || !instagram || !website) {
-      queries.push(`${shortQuery}${cityPart} site oficial instagram cnpj`);
+    const cityPart = cityState ? ` ${cityState.split(/[-/]/)[0].trim()}` : '';
+    if (primaryName || legalName) {
+      const baseName = (primaryName || legalName || '').trim();
+      const dashParts = baseName.split(/\s+-\s+/).map((p) => p.trim()).filter(Boolean);
+      const shortQuery =
+        dashParts.length > 1 && dashParts[dashParts.length - 1].length <= 24
+          ? dashParts[dashParts.length - 1]
+          : baseName.split(/\s+/).slice(0, 6).join(' ');
+      queries.push(`${shortQuery}${cityPart}`);
+      if (!website || !instagram || !cnpjDigits) {
+        queries.push(`${shortQuery}${cityPart} site oficial instagram cnpj`);
+      }
+    } else if (cnpjDigits) {
+      queries.push(`"${formatCnpj(cnpjDigits)}"`);
+    } else if (primaryHandle) {
+      queries.push(`"${primaryHandle}" instagram empresa`);
+    } else if (interpreted.phones[0]) {
+      queries.push(`"${interpreted.phones[0]}"`);
     }
 
-    const searchHitsNested = await Promise.all(queries.map((q) => searchPublicWeb(q)));
+    const searchHitsNested = await Promise.all(queries.slice(0, 2).map((q) => searchPublicWeb(q)));
     const allHits = searchHitsNested.flat();
 
     if (allHits.length === 0) {
       limitations.push(
-        'Busca web complementar não retornou resultados adicionais acessíveis no momento.'
+        'Busca web complementar não retornou resultados públicos indexados no momento.'
       );
     }
 
@@ -1245,9 +1486,17 @@ export async function runUniversalCompanyResearch(
       const matchQuality = evaluateIdentityMatch(anchor, hitText, hit.url, validHitCnpj);
       if (matchQuality === 'rejected') continue;
 
+      // Cross-confirm name/phone/address if a hit matches strongly
+      if (matchQuality === 'confirmed' && primaryName && fieldStatuses.name === 'unconfirmed') {
+        fieldStatuses.name = 'confirmed';
+      }
+      if (phone && hitText.replace(/\D/g, '').includes(last8Digits(phone))) {
+        fieldStatuses.phone = 'confirmed';
+      }
+
       const hitLower = hit.url.toLowerCase();
       if (hitLower.includes('instagram.com/') && !hitLower.includes('/p/') && !hitLower.includes('/reel/')) {
-        if (!instagram) {
+        if (!instagram || fieldStatuses.instagram !== 'confirmed') {
           instagram = hit.url.split('?')[0];
           fieldStatuses.instagram = matchQuality;
         }
@@ -1259,9 +1508,7 @@ export async function runUniversalCompanyResearch(
         }
         addSource(hit.title || 'Facebook', hit.url, 'social');
       } else if (hitLower.includes('linkedin.com/company/')) {
-        if (!linkedin) {
-          linkedin = hit.url.split('?')[0];
-        }
+        if (!linkedin) linkedin = hit.url.split('?')[0];
         addSource(hit.title || 'LinkedIn', hit.url, 'social');
       } else if (hitLower.includes('google.com/maps') || hitLower.includes('maps.app.goo.gl')) {
         if (!googleMapsUrl) {
@@ -1278,7 +1525,10 @@ export async function runUniversalCompanyResearch(
           pagesToInspect.push({ url: hit.url, status: matchQuality });
         } else {
           addSource(hit.title || hitHost, hit.url, 'web');
-          if (pagesToInspect.length < 3 && (hitHost.includes('cnpj') || hitHost.includes('casadosdados') || hitHost.includes('guiamais'))) {
+          if (
+            pagesToInspect.length < 3 &&
+            (hitHost.includes('cnpj') || hitHost.includes('casadosdados') || hitHost.includes('guiamais'))
+          ) {
             pagesToInspect.push({ url: hit.url, status: matchQuality });
           }
         }
@@ -1290,61 +1540,70 @@ export async function runUniversalCompanyResearch(
       }
     }
 
-    // Fetch up to 2 complementary pages (official website / CNPJ page) to enrich address, phone, WhatsApp, CNPJ
+    // Fetch up to 2 complementary pages (official website / directory) to enrich & confirm address, phone, WhatsApp, CNPJ
     for (const candidate of pagesToInspect.slice(0, 2)) {
-      if (candidate.url === resolvedUrl) continue;
+      if (inspectedPages.has(candidate.url)) continue;
       const subFetch = await safeFetchPublicHtml(candidate.url);
       if (!subFetch.ok || !subFetch.html) continue;
+      inspectedPages.add(subFetch.resolvedUrl);
 
       const subFacts = extractFromHtml(subFetch.html, subFetch.resolvedUrl);
       const subVerification = evaluateIdentityMatch(
         anchor,
-        `${subFacts.businessName || ''} ${subFacts.metaDescription || ''} ${subFacts.visibleTextSample.slice(0, 800)}`,
+        `${subFacts.businessName || ''} ${subFacts.metaDescription || ''} ${subFacts.visibleTextSample.slice(0, 900)}`,
         subFetch.resolvedUrl,
         subFacts.cnpjs[0] || null
       );
       if (subVerification === 'rejected') continue;
 
-      if (!primaryName && subFacts.businessName) {
+      if (subFacts.businessName && (!primaryName || fieldStatuses.name !== 'confirmed')) {
         primaryName = subFacts.businessName;
         fieldStatuses.name = subVerification;
       }
-      if (!legalName && subFacts.legalName) {
+      if (subFacts.legalName && !legalName) {
         legalName = subFacts.legalName;
         fieldStatuses.legalName = subVerification;
       }
-      if (!cnpjDigits && subFacts.cnpjs[0]) {
+      if (subFacts.cnpjs[0] && !cnpjDigits) {
         cnpjDigits = subFacts.cnpjs[0];
         fieldStatuses.cnpj = subVerification;
       }
-      if (!address && subFacts.address) {
+      if (subFacts.address && (!address || fieldStatuses.address !== 'confirmed')) {
         address = subFacts.address;
         fieldStatuses.address = subVerification;
       }
-      if (!phone && subFacts.phones[0]) {
+      if (subFacts.cityState && !cityState) cityState = subFacts.cityState;
+      if (subFacts.phones[0] && (!phone || fieldStatuses.phone !== 'confirmed')) {
         phone = subFacts.phones[0];
         fieldStatuses.phone = subVerification;
       }
-      if (!whatsapp && subFacts.whatsapps[0]) {
+      if (subFacts.whatsapps[0] && !whatsapp) {
         whatsapp = subFacts.whatsapps[0];
         fieldStatuses.whatsapp = subVerification;
       }
-      if (!instagram && subFacts.instagrams[0]) {
+      if (subFacts.hours && !hours) {
+        hours = subFacts.hours;
+        fieldStatuses.hours = subVerification;
+      }
+      if (subFacts.instagrams[0] && (!instagram || fieldStatuses.instagram !== 'confirmed')) {
         instagram = subFacts.instagrams[0];
         fieldStatuses.instagram = subVerification;
       }
-      if (!facebook && subFacts.facebooks[0]) {
+      if (subFacts.facebooks[0] && !facebook) {
         facebook = subFacts.facebooks[0];
         fieldStatuses.facebook = subVerification;
       }
-      if (!googleMapsUrl && subFacts.googleMapsUrls[0]) {
+      if (subFacts.googleMapsUrls[0] && !googleMapsUrl) {
         googleMapsUrl = subFacts.googleMapsUrls[0];
         fieldStatuses.googleMapsUrl = subVerification;
       }
+      if (subFacts.metaDescription && !metaDescription) {
+        metaDescription = subFacts.metaDescription;
+      }
     }
 
-    // If complementary search uncovered a CNPJ we hadn't queried yet, enrich via BrasilAPI!
-    if (cnpjDigits && fieldStatuses.legalName === 'not_found') {
+    // If complementary search uncovered a CNPJ we hadn't queried yet, enrich via BrasilAPI / CNPJ.ws / MinhaReceita
+    if (cnpjDigits && fieldStatuses.legalName !== 'confirmed') {
       const cnpjRecord = await lookupCnpjPublicData(cnpjDigits);
       if (cnpjRecord) {
         const cnpjMatch = evaluateIdentityMatch(
@@ -1373,19 +1632,50 @@ export async function runUniversalCompanyResearch(
     }
   } else {
     limitations.push(
-      'Não foi possível extrair um nome comercial ou CNPJ claro da URL informada; confirme manualmente os dados principais.'
+      'O material enviado não apresentou nome comercial, CNPJ ou link suficiente para busca externa; confirme os dados manualmente.'
     );
   }
 
+  // Final status consistency pass
+  if (!primaryName) fieldStatuses.name = 'not_found';
+  if (!legalName) fieldStatuses.legalName = 'not_found';
+  if (!cnpjDigits) fieldStatuses.cnpj = 'not_found';
+  if (!address) fieldStatuses.address = 'not_found';
+  if (!phone) fieldStatuses.phone = 'not_found';
+  if (!whatsapp) fieldStatuses.whatsapp = 'not_found';
+  if (!hours) fieldStatuses.hours = 'not_found';
   if (!website) fieldStatuses.website = 'not_found';
   if (!instagram) fieldStatuses.instagram = 'not_found';
   if (!facebook) fieldStatuses.facebook = 'not_found';
   if (!googleMapsUrl) fieldStatuses.googleMapsUrl = 'not_found';
 
+  if (verifiedSources.length === 0) {
+    limitations.push(
+      'Nenhuma fonte pública externa confirmou esta empresa; os dados exibidos refletem apenas o material enviado e foram marcados como não confirmados ou não encontrados.'
+    );
+  }
+
+  const bestVerifiedUrl =
+    normalizeHttpUrl(googleMapsUrl) ||
+    normalizeHttpUrl(website) ||
+    normalizeHttpUrl(instagram) ||
+    normalizeHttpUrl(interpreted.urls[0]) ||
+    '';
+
+  const referenceLabel =
+    normalizeHttpUrl(interpreted.urls[0]) ||
+    primaryName ||
+    (cnpjDigits ? formatCnpj(cnpjDigits) : null) ||
+    interpreted.sourceSummary;
+
   return {
-    originalInputUrl: rawInputUrl,
-    resolvedMapsUrl: googleMapsUrl || resolvedUrl,
-    sourceOrigin: originLabelMap[classification.origin],
+    originalInputUrl: referenceLabel,
+    resolvedMapsUrl: normalizeHttpUrl(googleMapsUrl) || bestVerifiedUrl,
+    sourceOrigin: primaryOriginLabel,
+    inputSummary: interpreted.sourceSummary,
+    ocrText: interpreted.ocrText,
+    extractedUrls: interpreted.urls,
+    maskedCpf: interpreted.maskedCpf,
     placeName: primaryName,
     legalName,
     cnpj: cnpjDigits ? formatCnpj(cnpjDigits) : null,
@@ -1396,22 +1686,34 @@ export async function runUniversalCompanyResearch(
     email,
     hours,
     segment,
-    productsAndServices: primaryFacts.productsAndServices,
+    productsAndServices,
     reviewsSummary: null,
     visualReferences: null,
     website,
     instagram,
     facebook,
     linkedin,
-    googleMapsUrl,
-    queryHint: classification.mapsQueryHint || classification.slugHint,
-    latLng: classification.mapsCoords,
-    metaTitle: primaryFacts.metaTitle || primaryFacts.title,
-    metaDescription: primaryFacts.metaDescription,
+    googleMapsUrl: normalizeHttpUrl(googleMapsUrl),
+    queryHint,
+    latLng,
+    metaTitle,
+    metaDescription,
     verifiedSources,
     fieldStatuses,
-    limitations,
-    researchNotes,
+    limitations: Array.from(new Set(limitations)),
+    researchNotes: Array.from(new Set(researchNotes)),
     capturedAt: new Date().toISOString(),
   };
+}
+
+export async function runUniversalCompanyResearch(
+  rawInputUrl: string,
+  onProgress?: (stage: string, detail: string) => void
+): Promise<CollectedResearchData> {
+  const interpreted = interpretBusinessMaterial({
+    rawText: rawInputUrl,
+    ocrText: null,
+    documentText: null,
+  });
+  return runUniversalCompanyResearchFromMaterial(interpreted, onProgress);
 }

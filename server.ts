@@ -2,6 +2,7 @@ import 'dotenv/config';
 import express from 'express';
 import type { Request, Response } from 'express';
 import path from 'node:path';
+import multer from 'multer';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
 import type {
   AnalysisErrorPayload,
@@ -9,12 +10,18 @@ import type {
   CollectedResearchData,
   CompanyProfile,
   ScannerBlueprintResult,
-  VerifiedSource,
 } from './src/types/blueprint.ts';
 import {
-  isPrivateOrBlockedHost,
+  ALLOWED_UPLOAD_MIME_TYPES,
+  interpretBusinessMaterial,
+  MAX_FILE_SIZE_BYTES,
+  MAX_FILES_COUNT,
+  processUploadedFiles,
+  type UploadedMaterialFile,
+} from './server/inputInterpreter.ts';
+import {
   normalizeHttpUrl,
-  runUniversalCompanyResearch,
+  runUniversalCompanyResearchFromMaterial,
 } from './server/universalResearch.ts';
 
 const PORT = 3000;
@@ -33,13 +40,161 @@ const ai = new GoogleGenAI({
 const blueprintCache = new Map<string, { result: ScannerBlueprintResult; expiresAt: number }>();
 const inFlightAnalyses = new Map<string, Promise<ScannerBlueprintResult>>();
 
-function normalizeCacheKey(resolvedUrl: string, rawInput: string): string {
-  try {
-    const u = new URL(resolvedUrl || rawInput);
-    return `${u.hostname.toLowerCase()}${u.pathname}${u.search}`.replace(/\/+$/, '');
-  } catch {
-    return rawInput.trim();
+function normalizeCacheKey(collected: CollectedResearchData, rawInput: string): string {
+  if (collected.cnpj) {
+    return `cnpj:${collected.cnpj.replace(/\D/g, '')}`;
   }
+  const urlCandidate = normalizeHttpUrl(collected.website || collected.instagram || collected.googleMapsUrl || collected.resolvedMapsUrl);
+  if (urlCandidate) {
+    try {
+      const u = new URL(urlCandidate);
+      return `url:${u.hostname.toLowerCase()}${u.pathname}${u.search}`.replace(/\/+$/, '');
+    } catch {
+      // fall through
+    }
+  }
+  const nameKey = (collected.placeName || collected.legalName || rawInput)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .trim();
+  const cityKey = (collected.cityState || '').toLowerCase().trim();
+  return `name:${nameKey}|${cityKey}`;
+}
+
+function asNonEmptyString(val: unknown, fallback: string): string {
+  return typeof val === 'string' && val.trim().length > 0 ? val.trim() : fallback;
+}
+
+function asStringArray(val: unknown, fallback: string[]): string[] {
+  if (!Array.isArray(val)) return fallback;
+  const cleaned = val
+    .filter((x): x is string => typeof x === 'string' && x.trim().length > 0)
+    .map((x) => x.trim());
+  return cleaned.length > 0 ? cleaned : fallback;
+}
+
+function sanitizeArchitecture(raw: unknown, fallback: AppArchitecture): AppArchitecture {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>;
+  const ta = (r.targetAudience && typeof r.targetAudience === 'object' ? r.targetAudience : {}) as Record<string, unknown>;
+  const vi = (r.visualIdentity && typeof r.visualIdentity === 'object' ? r.visualIdentity : {}) as Record<string, unknown>;
+  const ty = (r.typography && typeof r.typography === 'object' ? r.typography : {}) as Record<string, unknown>;
+  const s3d = (r.style3DAndEffects && typeof r.style3DAndEffects === 'object' ? r.style3DAndEffects : {}) as Record<string, unknown>;
+  const nav = (r.navigationAndUX && typeof r.navigationAndUX === 'object' ? r.navigationAndUX : {}) as Record<string, unknown>;
+  const wa = (r.whatsappAndSocialStrategy && typeof r.whatsappAndSocialStrategy === 'object' ? r.whatsappAndSocialStrategy : {}) as Record<string, unknown>;
+
+  const colorPalette =
+    Array.isArray(r.colorPalette) && r.colorPalette.length > 0
+      ? r.colorPalette
+          .filter((c): c is Record<string, unknown> => Boolean(c && typeof c === 'object'))
+          .map((c, idx) => {
+            const fb = fallback.colorPalette[idx] || fallback.colorPalette[0];
+            return {
+              name: asNonEmptyString(c.name, fb.name),
+              hex: asNonEmptyString(c.hex, fb.hex),
+              role: asNonEmptyString(c.role, fb.role),
+              usage: asNonEmptyString(c.usage, fb.usage),
+            };
+          })
+      : fallback.colorPalette;
+
+  const screens =
+    Array.isArray(r.screens) && r.screens.length > 0
+      ? r.screens
+          .filter((s): s is Record<string, unknown> => Boolean(s && typeof s === 'object'))
+          .map((s, idx) => {
+            const fb = fallback.screens[idx] || fallback.screens[0];
+            return {
+              id: asNonEmptyString(s.id, fb.id),
+              name: asNonEmptyString(s.name, fb.name),
+              route: asNonEmptyString(s.route, fb.route),
+              purpose: asNonEmptyString(s.purpose, fb.purpose),
+              layoutStructure: asNonEmptyString(s.layoutStructure, fb.layoutStructure),
+              keyComponents: asStringArray(s.keyComponents, fb.keyComponents),
+              primaryButtons: asStringArray(s.primaryButtons, fb.primaryButtons),
+              userInteractions: asStringArray(s.userInteractions, fb.userInteractions),
+            };
+          })
+      : fallback.screens;
+
+  const buttonsAndFeatures =
+    Array.isArray(r.buttonsAndFeatures) && r.buttonsAndFeatures.length > 0
+      ? r.buttonsAndFeatures
+          .filter((b): b is Record<string, unknown> => Boolean(b && typeof b === 'object'))
+          .map((b, idx) => {
+            const fb = fallback.buttonsAndFeatures[idx] || fallback.buttonsAndFeatures[0];
+            return {
+              label: asNonEmptyString(b.label, fb.label),
+              action: asNonEmptyString(b.action, fb.action),
+              screenLocation: asNonEmptyString(b.screenLocation, fb.screenLocation),
+              businessValue: asNonEmptyString(b.businessValue, fb.businessValue),
+            };
+          })
+      : fallback.buttonsAndFeatures;
+
+  const recommendedIntegrations =
+    Array.isArray(r.recommendedIntegrations) && r.recommendedIntegrations.length > 0
+      ? r.recommendedIntegrations
+          .filter((it): it is Record<string, unknown> => Boolean(it && typeof it === 'object'))
+          .map((it, idx) => {
+            const fb = fallback.recommendedIntegrations[idx] || fallback.recommendedIntegrations[0];
+            return {
+              name: asNonEmptyString(it.name, fb.name),
+              category: asNonEmptyString(it.category, fb.category),
+              purpose: asNonEmptyString(it.purpose, fb.purpose),
+              costTier: asNonEmptyString(it.costTier, fb.costTier),
+            };
+          })
+      : fallback.recommendedIntegrations;
+
+  return {
+    conceptAndObjective: asNonEmptyString(r.conceptAndObjective, fallback.conceptAndObjective),
+    targetAudience: {
+      primaryPersona: asNonEmptyString(ta.primaryPersona, fallback.targetAudience.primaryPersona),
+      secondaryPersona: asNonEmptyString(ta.secondaryPersona, fallback.targetAudience.secondaryPersona),
+      painPoints: asStringArray(ta.painPoints, fallback.targetAudience.painPoints),
+      mobileHabits: asNonEmptyString(ta.mobileHabits, fallback.targetAudience.mobileHabits),
+    },
+    visualIdentity: {
+      styleDirection: asNonEmptyString(vi.styleDirection, fallback.visualIdentity.styleDirection),
+      atmosphere: asNonEmptyString(vi.atmosphere, fallback.visualIdentity.atmosphere),
+      brandVoice: asNonEmptyString(vi.brandVoice, fallback.visualIdentity.brandVoice),
+      motif3D: asNonEmptyString(vi.motif3D, fallback.visualIdentity.motif3D),
+    },
+    colorPalette,
+    typography: {
+      displayFont: asNonEmptyString(ty.displayFont, fallback.typography.displayFont),
+      bodyFont: asNonEmptyString(ty.bodyFont, fallback.typography.bodyFont),
+      monoFont: asNonEmptyString(ty.monoFont, fallback.typography.monoFont),
+      rationale: asNonEmptyString(ty.rationale, fallback.typography.rationale),
+    },
+    style3DAndEffects: {
+      depthSystem: asNonEmptyString(s3d.depthSystem, fallback.style3DAndEffects.depthSystem),
+      lightingAndShadows: asNonEmptyString(s3d.lightingAndShadows, fallback.style3DAndEffects.lightingAndShadows),
+      neonAndAccentTreatment: asNonEmptyString(s3d.neonAndAccentTreatment, fallback.style3DAndEffects.neonAndAccentTreatment),
+      microInteractions: asNonEmptyString(s3d.microInteractions, fallback.style3DAndEffects.microInteractions),
+      buttonStyle: asNonEmptyString(s3d.buttonStyle, fallback.style3DAndEffects.buttonStyle),
+    },
+    screens,
+    buttonsAndFeatures,
+    navigationAndUX: {
+      navigationPattern: asNonEmptyString(nav.navigationPattern, fallback.navigationAndUX.navigationPattern),
+      userFlowSteps: asStringArray(nav.userFlowSteps, fallback.navigationAndUX.userFlowSteps),
+      accessibilityNotes: asNonEmptyString(nav.accessibilityNotes, fallback.navigationAndUX.accessibilityNotes),
+    },
+    recommendedIntegrations,
+    whatsappAndSocialStrategy: {
+      whatsappFlow: asNonEmptyString(wa.whatsappFlow, fallback.whatsappAndSocialStrategy.whatsappFlow),
+      prefilledMessageTemplate: asNonEmptyString(
+        wa.prefilledMessageTemplate,
+        fallback.whatsappAndSocialStrategy.prefilledMessageTemplate
+      ),
+      instagramFunnel: asNonEmptyString(wa.instagramFunnel, fallback.whatsappAndSocialStrategy.instagramFunnel),
+      facebookAndLocalSeo: asNonEmptyString(wa.facebookAndLocalSeo, fallback.whatsappAndSocialStrategy.facebookAndLocalSeo),
+      retentionTactics: asStringArray(wa.retentionTactics, fallback.whatsappAndSocialStrategy.retentionTactics),
+    },
+  };
 }
 
 function extractJsonObject(rawText: string): Record<string, unknown> {
@@ -57,6 +212,57 @@ function extractJsonObject(rawText: string): Record<string, unknown> {
     }
     throw new Error('A resposta consolidada não retornou um JSON válido.');
   }
+}
+
+function renderExecutiveReportMarkdown(
+  collected: CollectedResearchData,
+  companyProfile: CompanyProfile,
+  architecture: AppArchitecture
+): string {
+  const statusTag = (key: string): string => {
+    const st = collected.fieldStatuses?.[key];
+    if (st === 'confirmed') return 'Confirmada';
+    if (st === 'unconfirmed') return 'Encontrada (não confirmada)';
+    return 'Não encontrada';
+  };
+
+  return [
+    `# Relatório Arquitetônico — ${companyProfile.name}`,
+    '',
+    '## 1. Identificação Universal da Empresa (Fontes Cruzadas)',
+    `- **Origem da identificação:** ${collected.inputSummary || collected.sourceOrigin || 'Material enviado'}`,
+    collected.maskedCpf ? `- **Proteção de dados:** CPF detectado mascarado (${collected.maskedCpf})` : '',
+    `- **Nome comercial:** ${companyProfile.name} — *Status: ${statusTag('name')}*`,
+    `- **Razão social:** ${companyProfile.legalName || 'Não localizada'} — *Status: ${statusTag('legalName')}*`,
+    `- **CNPJ:** ${companyProfile.cnpj || 'Não localizado'} — *Status: ${statusTag('cnpj')}*`,
+    `- **Segmento:** ${companyProfile.category}`,
+    `- **Endereço:** ${companyProfile.address} — *Status: ${statusTag('address')}*`,
+    `- **Telefone:** ${companyProfile.phone} — *Status: ${statusTag('phone')}*`,
+    `- **WhatsApp:** ${companyProfile.whatsapp || 'Não localizado'} — *Status: ${statusTag('whatsapp')}*`,
+    `- **Horários:** ${companyProfile.hours} — *Status: ${statusTag('hours')}*`,
+    `- **Site oficial:** ${companyProfile.socialLinks.website || 'Não localizado'} — *Status: ${statusTag('website')}*`,
+    `- **Instagram:** ${companyProfile.socialLinks.instagram || 'Não localizado'} — *Status: ${statusTag('instagram')}*`,
+    `- **Facebook:** ${companyProfile.socialLinks.facebook || 'Não localizado'} — *Status: ${statusTag('facebook')}*`,
+    `- **Google Maps:** ${collected.googleMapsUrl || 'Não localizado'} — *Status: ${statusTag('googleMapsUrl')}*`,
+    '',
+    '### Limitações e Transparência',
+    ...companyProfile.limitations.map((l) => `- ${l}`),
+    '',
+    '## 2. Arquitetura do Aplicativo (11 Pilares)',
+    `### 01. Conceito e Objetivo\n${architecture.conceptAndObjective}`,
+    `### 02. Público-Alvo\n- **Primário:** ${architecture.targetAudience.primaryPersona}\n- **Secundário:** ${architecture.targetAudience.secondaryPersona}\n- **Hábitos Mobile:** ${architecture.targetAudience.mobileHabits}`,
+    `### 03. Identidade Visual\n${architecture.visualIdentity.styleDirection} Atmosfera: ${architecture.visualIdentity.atmosphere}`,
+    `### 04. Paleta de Cores\n${architecture.colorPalette.map((c) => `- **${c.name} (${c.hex})** — ${c.role}: ${c.usage}`).join('\n')}`,
+    `### 05. Tipografia\n- Display: ${architecture.typography.displayFont}\n- Corpo: ${architecture.typography.bodyFont}\n- Dados: ${architecture.typography.monoFont}`,
+    `### 06. Estilo 3D e Efeitos Visuais\n${architecture.style3DAndEffects.depthSystem} ${architecture.style3DAndEffects.lightingAndShadows}`,
+    `### 07. Telas Projetadas\n${architecture.screens.map((s, i) => `${i + 1}. **${s.name}** (\`${s.route}\`): ${s.purpose}`).join('\n')}`,
+    `### 08. Botões e Funcionalidades\n${architecture.buttonsAndFeatures.map((b) => `- **${b.label}** (${b.screenLocation}): ${b.action}`).join('\n')}`,
+    `### 09. Navegação e UX\n${architecture.navigationAndUX.navigationPattern}`,
+    `### 10. Integrações Recomendadas\n${architecture.recommendedIntegrations.map((r) => `- **${r.name}** (${r.costTier}): ${r.purpose}`).join('\n')}`,
+    `### 11. Estratégia WhatsApp e Redes Sociais\n${architecture.whatsappAndSocialStrategy.whatsappFlow}\n- Mensagem modelo: \`${architecture.whatsappAndSocialStrategy.prefilledMessageTemplate}\``,
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 function buildBlueprintFromCollectedData(
@@ -99,7 +305,10 @@ function buildBlueprintFromCollectedData(
     limitations.push('Site institucional oficial não localizado ou ausente.');
   }
 
-  const verifiedGoogleMapsUrl = collected.googleMapsUrl || collected.resolvedMapsUrl;
+  const verifiedGoogleMapsUrl =
+    normalizeHttpUrl(collected.googleMapsUrl) ||
+    normalizeHttpUrl(collected.resolvedMapsUrl) ||
+    '';
 
   const companyProfile: CompanyProfile = {
     name: businessName,
@@ -272,8 +481,10 @@ function buildBlueprintFromCollectedData(
         businessValue: 'Acelera a conversão de visitantes mobile em atendimentos reais.',
       },
       {
-        label: collected.googleMapsUrl ? 'Abrir no Google Maps' : 'Abrir Canal Principal',
-        action: `Direciona para o link verificado (${verifiedGoogleMapsUrl})`,
+        label: verifiedGoogleMapsUrl ? 'Abrir no Google Maps' : 'Abrir Canal Principal',
+        action: verifiedGoogleMapsUrl
+          ? `Direciona para o link verificado (${verifiedGoogleMapsUrl})`
+          : 'Abre o canal oficial ou endereço confirmado na seção Localização',
         screenLocation: 'Início e Localização',
         businessValue: 'Facilita validação e deslocamento presencial com 1 toque.',
       },
@@ -337,40 +548,7 @@ function buildBlueprintFromCollectedData(
     },
   };
 
-  const executiveReportMarkdown = [
-    `# Relatório Arquitetônico — ${businessName}`,
-    '',
-    '## 1. Identificação Universal da Empresa (Fontes Cruzadas)',
-    `- **Origem inicial pesquisada:** ${collected.sourceOrigin || 'Link público'} (${collected.originalInputUrl})`,
-    `- **Nome comercial:** ${companyProfile.name} — *Status: ${statusTag('name')}*`,
-    `- **Razão social:** ${companyProfile.legalName || 'Não localizada'} — *Status: ${statusTag('legalName')}*`,
-    `- **CNPJ:** ${companyProfile.cnpj || 'Não localizado'} — *Status: ${statusTag('cnpj')}*`,
-    `- **Segmento:** ${companyProfile.category}`,
-    `- **Endereço:** ${companyProfile.address} — *Status: ${statusTag('address')}*`,
-    `- **Telefone:** ${companyProfile.phone} — *Status: ${statusTag('phone')}*`,
-    `- **WhatsApp:** ${companyProfile.whatsapp || 'Não localizado'} — *Status: ${statusTag('whatsapp')}*`,
-    `- **Horários:** ${companyProfile.hours} — *Status: ${statusTag('hours')}*`,
-    `- **Site oficial:** ${companyProfile.socialLinks.website || 'Não localizado'} — *Status: ${statusTag('website')}*`,
-    `- **Instagram:** ${companyProfile.socialLinks.instagram || 'Não localizado'} — *Status: ${statusTag('instagram')}*`,
-    `- **Facebook:** ${companyProfile.socialLinks.facebook || 'Não localizado'} — *Status: ${statusTag('facebook')}*`,
-    `- **Google Maps:** ${collected.googleMapsUrl || 'Não localizado'} — *Status: ${statusTag('googleMapsUrl')}*`,
-    '',
-    '### Limitações e Transparência',
-    ...companyProfile.limitations.map((l) => `- ${l}`),
-    '',
-    '## 2. Arquitetura do Aplicativo (11 Pilares)',
-    `### 01. Conceito e Objetivo\n${architecture.conceptAndObjective}`,
-    `### 02. Público-Alvo\n- **Primário:** ${architecture.targetAudience.primaryPersona}\n- **Secundário:** ${architecture.targetAudience.secondaryPersona}\n- **Hábitos Mobile:** ${architecture.targetAudience.mobileHabits}`,
-    `### 03. Identidade Visual\n${architecture.visualIdentity.styleDirection} Atmosfera: ${architecture.visualIdentity.atmosphere}`,
-    `### 04. Paleta de Cores\n${architecture.colorPalette.map((c) => `- **${c.name} (${c.hex})** — ${c.role}: ${c.usage}`).join('\n')}`,
-    `### 05. Tipografia\n- Display: ${architecture.typography.displayFont}\n- Corpo: ${architecture.typography.bodyFont}\n- Dados: ${architecture.typography.monoFont}`,
-    `### 06. Estilo 3D e Efeitos Visuais\n${architecture.style3DAndEffects.depthSystem} ${architecture.style3DAndEffects.lightingAndShadows}`,
-    `### 07. Telas Projetadas\n${architecture.screens.map((s, i) => `${i + 1}. **${s.name}** (\`${s.route}\`): ${s.purpose}`).join('\n')}`,
-    `### 08. Botões e Funcionalidades\n${architecture.buttonsAndFeatures.map((b) => `- **${b.label}** (${b.screenLocation}): ${b.action}`).join('\n')}`,
-    `### 09. Navegação e UX\n${architecture.navigationAndUX.navigationPattern}`,
-    `### 10. Integrações Recomendadas\n${architecture.recommendedIntegrations.map((r) => `- **${r.name}** (${r.costTier}): ${r.purpose}`).join('\n')}`,
-    `### 11. Estratégia WhatsApp e Redes Sociais\n${architecture.whatsappAndSocialStrategy.whatsappFlow}\n- Mensagem modelo: \`${architecture.whatsappAndSocialStrategy.prefilledMessageTemplate}\``,
-  ].join('\n\n');
+  const executiveReportMarkdown = renderExecutiveReportMarkdown(collected, companyProfile, architecture);
 
   const finalBuildPrompt = [
     `Atue como engenheiro front-end sênior e designer UI/UX especialista em experiências 3D modernas. Construa o aplicativo web comercial oficial para a empresa "${businessName}".`,
@@ -446,7 +624,7 @@ function classifyGeminiError(
       status: 401,
       code: 'AUTH_ERROR',
       message:
-        'A chave da API Gemini não está configurada ou é inválida. Os dados identificados na web foram preservados; gere o projeto agora mesmo com os dados disponíveis.',
+        'A chave da API Gemini não está configurada ou é inválida. Os dados identificados foram preservados; gere o projeto agora mesmo com os dados disponíveis.',
       collectedData,
     };
   }
@@ -473,48 +651,44 @@ async function runConsolidatedGeminiScan(collected: CollectedResearchData): Prom
   const fallback = buildBlueprintFromCollectedData(collected);
 
   const consolidatedPrompt = [
-    'Você é o núcleo de inteligência arquitetônica do VIRA SCANNER 3D.',
-    'Atue simultaneamente como arquiteto de aplicativos, designer UI/UX, diretor de arte, especialista em identidade visual, estrategista comercial e especialista em experiência mobile.',
+    'Você é o núcleo arquitetônico do VIRA SCANNER 3D (arquiteto de apps, UI/UX, diretor de arte, branding, estrategista mobile).',
+    'REGRA PRINCIPAL: Gere EXCLUSIVAMENTE um projeto arquitetônico personalizado (11 pilares) e UM ÚNICO PROMPT FINAL DE CONSTRUÇÃO para o aplicativo comercial desta empresa. Nunca construa o app.',
     '',
-    'REGRA PRINCIPAL: Seu produto final é EXCLUSIVAMENTE um projeto arquitetônico completo e UM ÚNICO PROMPT FINAL DE CONSTRUÇÃO para o aplicativo comercial desta empresa. Nunca construa o aplicativo da empresa.',
-    '',
-    'DADOS JÁ IDENTIFICADOS E CRUZADOS NAS FONTES PÚBLICAS:',
-    `- Origem do link: ${collected.sourceOrigin || 'Página pública'} (${collected.originalInputUrl})`,
-    `- Nome comercial: ${fallback.companyProfile.name} (status: ${collected.fieldStatuses?.name || 'unconfirmed'})`,
-    collected.legalName ? `- Razão social: ${collected.legalName} (status: ${collected.fieldStatuses?.legalName || 'confirmed'})` : '',
-    collected.cnpj ? `- CNPJ: ${collected.cnpj} (status: ${collected.fieldStatuses?.cnpj || 'confirmed'})` : '',
+    'DADOS IDENTIFICADOS E VERIFICADOS (NUNCA INVENTE DADOS AUSENTES):',
+    `- Origem: ${collected.inputSummary || collected.sourceOrigin || 'Material enviado'}`,
+    `- Nome: ${fallback.companyProfile.name} (${collected.fieldStatuses?.name || 'unconfirmed'})`,
+    collected.legalName ? `- Razão social: ${collected.legalName}` : '',
+    collected.cnpj ? `- CNPJ: ${collected.cnpj}` : '',
     collected.segment ? `- Segmento: ${collected.segment}` : '',
-    collected.address ? `- Endereço: ${collected.address} (status: ${collected.fieldStatuses?.address || 'unconfirmed'})` : '- Endereço: Não localizado nas fontes públicas',
+    collected.address ? `- Endereço: ${collected.address}` : '- Endereço: Não localizado',
     collected.phone ? `- Telefone: ${collected.phone}` : '- Telefone: Não localizado',
     collected.whatsapp ? `- WhatsApp: ${collected.whatsapp}` : '',
     collected.hours ? `- Horários: ${collected.hours}` : '- Horários: Não localizados',
-    collected.website ? `- Site oficial: ${collected.website}` : '- Site oficial: Não localizado',
-    collected.instagram ? `- Instagram: ${collected.instagram}` : '- Instagram: Não localizado',
-    collected.facebook ? `- Facebook: ${collected.facebook}` : '- Facebook: Não localizado',
-    collected.googleMapsUrl ? `- Google Maps: ${collected.googleMapsUrl}` : '- Google Maps: Não localizado',
+    collected.website ? `- Site: ${collected.website}` : '',
+    collected.instagram ? `- Instagram: ${collected.instagram}` : '',
+    collected.facebook ? `- Facebook: ${collected.facebook}` : '',
+    collected.googleMapsUrl ? `- Maps: ${collected.googleMapsUrl}` : '',
     collected.metaDescription ? `- Descrição pública: ${collected.metaDescription}` : '',
     collected.limitations && collected.limitations.length > 0
-      ? `- Limitações registradas: ${collected.limitations.join(' | ')}`
+      ? `- Limitações: ${collected.limitations.slice(0, 4).join(' | ')}`
       : '',
     '',
-    'REGRAS DE VERACIDADE:',
-    '- NUNCA invente telefones, endereços, CNPJs, horários, notas ou URLs que não estejam listados acima.',
-    '- Mantenha `website`, `instagram`, `facebook` exatamente como acima (`null` quando ausentes).',
-    '- Diferencie claramente informações confirmadas, encontradas mas não confirmadas, e não encontradas.',
-    '',
-    'FORMATO DE SAÍDA OBRIGATÓRIO:',
-    'Retorne EXCLUSIVAMENTE um único objeto JSON válido em Português do Brasil com a seguinte estrutura:',
+    'Retorne EXCLUSIVAMENTE um JSON válido em Português do Brasil com as chaves:',
     JSON.stringify({
-      companyProfile: fallback.companyProfile,
+      companyProfile: {
+        category: fallback.companyProfile.category,
+        productsAndServices: fallback.companyProfile.productsAndServices,
+        reviewsAndDifferentiators: fallback.companyProfile.reviewsAndDifferentiators,
+        identityAndPositioning: fallback.companyProfile.identityAndPositioning,
+      },
       architecture: fallback.architecture,
-      executiveReportMarkdown: 'string',
-      finalBuildPrompt: 'string',
+      finalBuildPrompt: 'string (prompt único completo e autocontido com os dados reais, paleta, tipografia, estética 3D, telas, botões e requisitos técnicos)',
     }),
   ]
     .filter(Boolean)
     .join('\n');
 
-  const response = await ai.models.generateContent({
+  const geminiPromise = ai.models.generateContent({
     model: MODEL_ID,
     contents: consolidatedPrompt,
     config: {
@@ -523,50 +697,53 @@ async function runConsolidatedGeminiScan(collected: CollectedResearchData): Prom
     },
   });
 
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error('Tempo limite da API Gemini atingido (24s).')), 24000)
+  );
+
+  const response = await Promise.race([geminiPromise, timeoutPromise]);
   const parsed = extractJsonObject(response.text || '') as Partial<ScannerBlueprintResult>;
   const rawProfile = parsed.companyProfile;
 
   const mergedProfile: CompanyProfile = {
     ...fallback.companyProfile,
-    ...rawProfile,
-    legalName: collected.legalName ?? rawProfile?.legalName ?? null,
-    cnpj: collected.cnpj ?? rawProfile?.cnpj ?? null,
-    whatsapp: collected.whatsapp ?? rawProfile?.whatsapp ?? null,
+    category: asNonEmptyString(rawProfile?.category, fallback.companyProfile.category),
+    reviewsAndDifferentiators: asNonEmptyString(
+      rawProfile?.reviewsAndDifferentiators,
+      fallback.companyProfile.reviewsAndDifferentiators
+    ),
+    identityAndPositioning: asNonEmptyString(
+      rawProfile?.identityAndPositioning,
+      fallback.companyProfile.identityAndPositioning
+    ),
+    productsAndServices: asStringArray(
+      rawProfile?.productsAndServices,
+      fallback.companyProfile.productsAndServices
+    ),
+    legalName: collected.legalName ?? null,
+    cnpj: collected.cnpj ?? null,
+    whatsapp: collected.whatsapp ?? null,
     sourceOrigin: collected.sourceOrigin,
     fieldStatuses: collected.fieldStatuses,
-    productsAndServices:
-      Array.isArray(rawProfile?.productsAndServices) && rawProfile.productsAndServices.length > 0
-        ? rawProfile.productsAndServices
-        : fallback.companyProfile.productsAndServices,
-    limitations:
-      Array.isArray(rawProfile?.limitations) && rawProfile.limitations.length > 0
-        ? rawProfile.limitations
-        : fallback.companyProfile.limitations,
-    socialLinks: {
-      googleMapsUrl: collected.googleMapsUrl || collected.resolvedMapsUrl,
-      website: normalizeHttpUrl(collected.website || rawProfile?.socialLinks?.website),
-      instagram: normalizeHttpUrl(collected.instagram || rawProfile?.socialLinks?.instagram),
-      facebook: normalizeHttpUrl(collected.facebook || rawProfile?.socialLinks?.facebook),
-      linkedin: normalizeHttpUrl(collected.linkedin || rawProfile?.socialLinks?.linkedin),
-    },
+    limitations: fallback.companyProfile.limitations,
+    socialLinks: fallback.companyProfile.socialLinks,
     verifiedSources: collected.verifiedSources,
   };
 
-  const mergedArchitecture: AppArchitecture = {
-    ...fallback.architecture,
-    ...(parsed.architecture || {}),
-  };
+  const mergedArchitecture = sanitizeArchitecture(parsed.architecture, fallback.architecture);
+  const executiveReportMarkdown = renderExecutiveReportMarkdown(
+    collected,
+    mergedProfile,
+    mergedArchitecture
+  );
 
   return {
     analyzedAt: new Date().toISOString(),
     originalInputUrl: collected.originalInputUrl,
-    resolvedMapsUrl: collected.googleMapsUrl || collected.resolvedMapsUrl,
+    resolvedMapsUrl: fallback.resolvedMapsUrl,
     companyProfile: mergedProfile,
     architecture: mergedArchitecture,
-    executiveReportMarkdown:
-      typeof parsed.executiveReportMarkdown === 'string' && parsed.executiveReportMarkdown.trim()
-        ? parsed.executiveReportMarkdown
-        : fallback.executiveReportMarkdown,
+    executiveReportMarkdown,
     finalBuildPrompt:
       typeof parsed.finalBuildPrompt === 'string' && parsed.finalBuildPrompt.trim()
         ? parsed.finalBuildPrompt
@@ -578,6 +755,27 @@ async function startServer(): Promise<void> {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
+  const upload = multer({
+    storage: multer.memoryStorage(),
+    limits: {
+      fileSize: MAX_FILE_SIZE_BYTES,
+      files: MAX_FILES_COUNT,
+    },
+    fileFilter: (_req, file, cb) => {
+      const mime = (file.mimetype || '').toLowerCase();
+      const extOk = /\.(png|jpg|jpeg|webp|gif|pdf|txt|csv|json|md)$/i.test(file.originalname || '');
+      if (ALLOWED_UPLOAD_MIME_TYPES.has(mime) || extOk) {
+        cb(null, true);
+      } else {
+        cb(
+          new Error(
+            `Tipo de arquivo não suportado ("${file.originalname}"). Envie PNG, JPG, WEBP, GIF, PDF, TXT, CSV, JSON ou MD.`
+          )
+        );
+      }
+    },
+  });
+
   app.get('/api/health', (_req: Request, res: Response) => {
     res.json({ ok: true });
   });
@@ -586,7 +784,17 @@ async function startServer(): Promise<void> {
     const collected = req.body?.collectedData as CollectedResearchData | undefined;
     const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : undefined;
 
-    if (!collected || typeof collected.resolvedMapsUrl !== 'string') {
+    const hasCollectedContent = Boolean(
+      collected &&
+        typeof collected === 'object' &&
+        (collected.placeName ||
+          collected.legalName ||
+          collected.cnpj ||
+          collected.inputSummary ||
+          collected.originalInputUrl)
+    );
+
+    if (!hasCollectedContent || !collected) {
       res.status(400).json({ error: 'Dados coletados inválidos ou ausentes para geração.' });
       return;
     }
@@ -595,122 +803,214 @@ async function startServer(): Promise<void> {
     res.json(result);
   });
 
-  app.post('/api/analyze', async (req: Request, res: Response) => {
-    const rawInput =
-      typeof req.body?.url === 'string'
-        ? req.body.url.trim()
-        : typeof req.body?.mapsUrl === 'string'
-          ? req.body.mapsUrl.trim()
-          : '';
-    const forceRefresh = Boolean(req.body?.forceRefresh);
+  app.post('/api/analyze', (req: Request, res: Response) => {
+    const contentType = (req.headers['content-type'] || '').toLowerCase();
 
-    if (!rawInput) {
-      res.status(400).json({ error: 'Informe um link público relacionado à empresa para iniciar a identificação.' });
-      return;
-    }
-
-    let parsedUrl: URL;
-    try {
-      parsedUrl = new URL(rawInput);
-    } catch {
-      res.status(400).json({
-        error: 'O texto informado não é uma URL válida. Cole um link completo começando com https:// ou http://.',
-      });
-      return;
-    }
-
-    if (
-      (parsedUrl.protocol !== 'https:' && parsedUrl.protocol !== 'http:') ||
-      isPrivateOrBlockedHost(parsedUrl.hostname)
-    ) {
-      res.status(400).json({
-        error: 'Informe uma URL pública válida (Instagram, Facebook, CNPJ, site, Google Maps ou página pública).',
-      });
-      return;
-    }
-
-    res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders?.();
-
-    let collectedData: CollectedResearchData | undefined;
-
-    try {
-      collectedData = await runUniversalCompanyResearch(rawInput, (stage, detail) => {
-        sendSse(res, 'status', { stage, detail });
-      });
-
-      const cacheKey = normalizeCacheKey(collectedData.resolvedMapsUrl, rawInput);
-
-      if (!forceRefresh) {
-        const cached = blueprintCache.get(cacheKey);
-        if (cached && cached.expiresAt > Date.now()) {
-          sendSse(res, 'status', {
-            stage: 'Recuperando análise consolidada',
-            detail: 'Empresa identificada recentemente; reutilizando resultado sem nova chamada à API.',
-          });
-          sendSse(res, 'result', cached.result);
-          res.end();
-          return;
-        }
+    const runPipeline = async (rawText: string, uploadedFiles: UploadedMaterialFile[], forceRefresh: boolean) => {
+      if (!rawText && uploadedFiles.length === 0) {
+        res.status(400).json({
+          error:
+            'Envie alguma informação da empresa: cole um texto, CNPJ, nome, endereço, link ou anexe uma imagem/documento.',
+        });
+        return;
       }
 
-      // If no GEMINI_API_KEY is configured, complete seamlessly using the universal research engine!
       const hasGeminiKey =
         Boolean(process.env.GEMINI_API_KEY) &&
         process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY';
 
-      if (!hasGeminiKey) {
-        sendSse(res, 'status', {
-          stage: 'Consolidando projeto e prompt final',
-          detail: 'Montando relatório arquitetônico com os dados públicos coletados (sem chave Gemini).',
+      // Prepare SSE only after basic input check succeeds, or validate interpreted signal before SSE?
+      // Better: process uploaded files & interpret first so insufficient-signal returns crisp HTTP 400 JSON!
+      // Wait: OCR can take ~1-4s; stream SSE right away so user sees OCR progress in UI,
+      // OR check plain text sufficiency fast, and stream SSE for OCR + research!
+      const isTextOnly = uploadedFiles.length === 0;
+      let preInterpreted = isTextOnly
+        ? interpretBusinessMaterial({ rawText, ocrText: null, documentText: null })
+        : null;
+
+      if (isTextOnly && preInterpreted && !preInterpreted.hasSufficientSignal) {
+        res.status(400).json({
+          error:
+            'Não foi possível identificar nenhum indício empresarial válido (nome, CNPJ, telefone, endereço, @instagram ou link). Tente incluir mais detalhes.',
         });
-        const localResult = buildBlueprintFromCollectedData(
-          collectedData,
-          'Síntese arquitetônica gerada diretamente pelos dados públicos identificados (chave Gemini não configurada).'
-        );
-        blueprintCache.set(cacheKey, {
-          result: localResult,
-          expiresAt: Date.now() + CACHE_TTL_MS,
-        });
-        sendSse(res, 'result', localResult);
-        res.end();
         return;
       }
 
-      sendSse(res, 'status', {
-        stage: 'Projetando arquitetura 3D e prompt final',
-        detail: collectedData.placeName
-          ? `Sintetizando projeto arquitetônico e prompt de construção para "${collectedData.placeName}".`
-          : 'Sintetizando projeto arquitetônico e prompt de construção com os dados identificados.',
-      });
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders?.();
 
-      let scanPromise = inFlightAnalyses.get(cacheKey);
-      if (!scanPromise) {
-        scanPromise = runConsolidatedGeminiScan(collectedData);
-        inFlightAnalyses.set(cacheKey, scanPromise);
-      }
+      let collectedData: CollectedResearchData | undefined;
 
-      let finalResult: ScannerBlueprintResult;
       try {
-        finalResult = await scanPromise;
-      } finally {
-        inFlightAnalyses.delete(cacheKey);
+        if (!preInterpreted) {
+          sendSse(res, 'status', {
+            stage: 'Processando anexos e leitura OCR',
+            detail: `Lendo ${uploadedFiles.length} arquivo(s) enviado(s) para extrair dados empresariais.`,
+          });
+          const extractedFiles = await processUploadedFiles(
+            uploadedFiles,
+            hasGeminiKey ? ai : null,
+            (stage, detail) => sendSse(res, 'status', { stage, detail })
+          );
+          preInterpreted = interpretBusinessMaterial({
+            rawText,
+            ocrText: extractedFiles.ocrText,
+            documentText: extractedFiles.documentText,
+            notes: extractedFiles.notes,
+            limitations: extractedFiles.limitations,
+          });
+        }
+
+        if (!preInterpreted.hasSufficientSignal) {
+          const errorPayload: AnalysisErrorPayload = {
+            status: 400,
+            code: 'INVALID_INPUT',
+            message:
+              'Não encontramos nome comercial, CNPJ, telefone, endereço ou link legível no material enviado. Tente digitar o nome/CNPJ ou enviar uma imagem mais nítida.',
+          };
+          sendSse(res, 'error', errorPayload);
+          res.end();
+          return;
+        }
+
+        sendSse(res, 'status', {
+          stage: 'Identificando empresa',
+          detail: preInterpreted.sourceSummary,
+        });
+
+        collectedData = await runUniversalCompanyResearchFromMaterial(preInterpreted, (stage, detail) => {
+          sendSse(res, 'status', { stage, detail });
+        });
+
+        const cacheKey = normalizeCacheKey(collectedData, rawText);
+
+        if (!forceRefresh) {
+          const cached = blueprintCache.get(cacheKey);
+          if (cached && cached.expiresAt > Date.now()) {
+            sendSse(res, 'status', {
+              stage: 'Recuperando análise consolidada',
+              detail: 'Empresa identificada recentemente; reutilizando resultado sem nova chamada à API.',
+            });
+            sendSse(res, 'result', cached.result);
+            res.end();
+            return;
+          }
+        }
+
+        if (!hasGeminiKey) {
+          sendSse(res, 'status', {
+            stage: 'Consolidando projeto e prompt final',
+            detail: 'Montando relatório arquitetônico com os dados públicos identificados (sem chave Gemini).',
+          });
+          const localResult = buildBlueprintFromCollectedData(
+            collectedData,
+            'Síntese arquitetônica gerada diretamente pelos dados identificados (chave Gemini não configurada).'
+          );
+          blueprintCache.set(cacheKey, {
+            result: localResult,
+            expiresAt: Date.now() + CACHE_TTL_MS,
+          });
+          sendSse(res, 'result', localResult);
+          res.end();
+          return;
+        }
+
+        sendSse(res, 'status', {
+          stage: 'Projetando arquitetura 3D e prompt final',
+          detail: collectedData.placeName
+            ? `Sintetizando projeto arquitetônico e prompt de construção para "${collectedData.placeName}".`
+            : 'Sintetizando projeto arquitetônico e prompt de construção com os dados identificados.',
+        });
+
+        let scanPromise = inFlightAnalyses.get(cacheKey);
+        if (!scanPromise) {
+          scanPromise = runConsolidatedGeminiScan(collectedData);
+          inFlightAnalyses.set(cacheKey, scanPromise);
+        }
+
+        let finalResult: ScannerBlueprintResult;
+        try {
+          finalResult = await scanPromise;
+        } finally {
+          inFlightAnalyses.delete(cacheKey);
+        }
+
+        blueprintCache.set(cacheKey, {
+          result: finalResult,
+          expiresAt: Date.now() + CACHE_TTL_MS,
+        });
+
+        sendSse(res, 'result', finalResult);
+        res.end();
+      } catch (error) {
+        console.error('[VIRA SCANNER 3D] /api/analyze error:', error);
+        const errorPayload = classifyGeminiError(error, collectedData);
+        if (errorPayload.code === 'UPSTREAM_ERROR' && collectedData) {
+          sendSse(res, 'status', {
+            stage: 'Consolidando projeto e prompt final',
+            detail: 'Aplicando motor local com os dados verificados (síntese de IA temporariamente indisponível).',
+          });
+          const resilientResult = buildBlueprintFromCollectedData(
+            collectedData,
+            'Síntese arquitetônica gerada diretamente pelo motor local com os dados verificados (serviço de IA temporariamente indisponível).'
+          );
+          sendSse(res, 'result', resilientResult);
+          res.end();
+          return;
+        }
+        sendSse(res, 'error', errorPayload);
+        res.end();
       }
+    };
 
-      blueprintCache.set(cacheKey, {
-        result: finalResult,
-        expiresAt: Date.now() + CACHE_TTL_MS,
+    if (contentType.includes('multipart/form-data')) {
+      upload.array('files', MAX_FILES_COUNT)(req, res, (err) => {
+        if (err) {
+          const multerCode = (err as { code?: string }).code;
+          const msg =
+            multerCode === 'LIMIT_FILE_SIZE'
+              ? 'Um dos arquivos excede o limite de 5 MB.'
+              : multerCode === 'LIMIT_FILE_COUNT'
+                ? `Envie no máximo ${MAX_FILES_COUNT} arquivos por identificação.`
+                : err instanceof Error
+                  ? err.message
+                  : 'Falha ao processar os arquivos enviados.';
+          res.status(400).json({ error: msg });
+          return;
+        }
+
+        const rawText =
+          typeof req.body?.text === 'string'
+            ? req.body.text.trim()
+            : typeof req.body?.url === 'string'
+              ? req.body.url.trim()
+              : typeof req.body?.mapsUrl === 'string'
+                ? req.body.mapsUrl.trim()
+                : '';
+        const forceRefresh = req.body?.forceRefresh === 'true' || req.body?.forceRefresh === true;
+        const expressFiles = Array.isArray(req.files) ? req.files : [];
+        const uploadedFiles: UploadedMaterialFile[] = expressFiles.map((f) => ({
+          originalname: f.originalname,
+          mimetype: f.mimetype,
+          size: f.size,
+          buffer: f.buffer,
+        }));
+
+        void runPipeline(rawText, uploadedFiles, forceRefresh);
       });
-
-      sendSse(res, 'result', finalResult);
-      res.end();
-    } catch (error) {
-      console.error('[VIRA SCANNER 3D] /api/analyze error:', error);
-      const errorPayload = classifyGeminiError(error, collectedData);
-      sendSse(res, 'error', errorPayload);
-      res.end();
+    } else {
+      const rawText =
+        typeof req.body?.text === 'string'
+          ? req.body.text.trim()
+          : typeof req.body?.url === 'string'
+            ? req.body.url.trim()
+            : typeof req.body?.mapsUrl === 'string'
+              ? req.body.mapsUrl.trim()
+              : '';
+      const forceRefresh = Boolean(req.body?.forceRefresh);
+      void runPipeline(rawText, [], forceRefresh);
     }
   });
 

@@ -74,6 +74,18 @@ export function BlueprintWorkspace({
   const promptChars = finalBuildPrompt.length;
   const promptLines = finalBuildPrompt.split('\n').length;
 
+  const rawHeaderCandidate =
+    companyProfile.socialLinks.googleMapsUrl ||
+    result.resolvedMapsUrl ||
+    companyProfile.socialLinks.website ||
+    companyProfile.socialLinks.instagram ||
+    '';
+  const validHeaderUrl = /^https?:\/\//i.test(rawHeaderCandidate.trim())
+    ? rawHeaderCandidate.trim()
+    : '';
+  const isGoogleMapsLink =
+    validHeaderUrl.includes('google.com/maps') || validHeaderUrl.includes('goo.gl');
+
   return (
     <div className="mx-auto max-w-7xl space-y-20 px-6 pb-24 pt-8">
       {/* SECTION 01: DOSSIÊ DA EMPRESA */}
@@ -97,21 +109,18 @@ export function BlueprintWorkspace({
             </div>
           </div>
 
-          <a
-            href={companyProfile.socialLinks.googleMapsUrl || result.resolvedMapsUrl}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="btn-3d-secondary inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-xs font-semibold text-slate-100 whitespace-nowrap shrink-0"
-          >
-            <MapPin className="h-3.5 w-3.5 text-cyan-300" />
-            <span>
-              {(companyProfile.socialLinks.googleMapsUrl || '').includes('google.com/maps') ||
-              (companyProfile.socialLinks.googleMapsUrl || '').includes('goo.gl')
-                ? 'Abrir no Google Maps'
-                : 'Abrir Link Analisado'}
-            </span>
-            <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
-          </a>
+          {validHeaderUrl && (
+            <a
+              href={validHeaderUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="btn-3d-secondary inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-xs font-semibold text-slate-100 whitespace-nowrap shrink-0"
+            >
+              <MapPin className="h-3.5 w-3.5 text-cyan-300" />
+              <span>{isGoogleMapsLink ? 'Abrir no Google Maps' : 'Abrir Link Verificado'}</span>
+              <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
+            </a>
+          )}
         </div>
 
         {/* Structured Dossier Grid (single-level depth, whitespace separated) */}
@@ -322,7 +331,7 @@ export function BlueprintWorkspace({
               </ul>
             ) : (
               <p className="text-sm text-slate-400">
-                Referência baseada exclusivamente na URL informada do Google Maps e metadados públicos extraídos.
+                Nenhuma fonte pública externa confirmou esta empresa; os dados exibidos refletem apenas o material enviado.
               </p>
             )}
           </div>
