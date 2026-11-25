@@ -1,0 +1,6 @@
+{
+  "name": "VIRA SCANNER 3D",
+  "description": "Arquiteto inteligente de aplicativos comerciais a partir de links do Google Maps, com pesquisa fundamentada, relatório arquitetônico e prompt final de construção.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
