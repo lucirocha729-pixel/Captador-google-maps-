@@ -1,7 +1,9 @@
+export type VerificationStatus = 'confirmed' | 'unconfirmed' | 'not_found';
+
 export interface VerifiedSource {
   title: string;
   url: string;
-  sourceType: 'google_maps' | 'web';
+  sourceType: 'google_maps' | 'web' | 'cnpj_api' | 'social' | 'official_site';
 }
 
 export interface SocialLinks {
@@ -9,13 +11,18 @@ export interface SocialLinks {
   website: string | null;
   instagram: string | null;
   facebook: string | null;
+  linkedin?: string | null;
 }
 
 export interface CompanyProfile {
   name: string;
+  legalName?: string | null;
+  cnpj?: string | null;
+  sourceOrigin?: string;
   category: string;
   address: string;
   phone: string;
+  whatsapp?: string | null;
   hours: string;
   locationSummary: string;
   productsAndServices: string[];
@@ -25,6 +32,7 @@ export interface CompanyProfile {
   identityAndPositioning: string;
   verifiedSources: VerifiedSource[];
   limitations: string[];
+  fieldStatuses?: Record<string, VerificationStatus>;
 }
 
 export interface ColorSwatch {
@@ -122,12 +130,33 @@ export interface AnalysisStageEvent {
 export interface CollectedResearchData {
   originalInputUrl: string;
   resolvedMapsUrl: string;
+  sourceOrigin?: string;
   placeName: string | null;
+  legalName?: string | null;
+  cnpj?: string | null;
+  address?: string | null;
+  cityState?: string | null;
+  phone?: string | null;
+  whatsapp?: string | null;
+  email?: string | null;
+  hours?: string | null;
+  segment?: string | null;
+  productsAndServices?: string[];
+  reviewsSummary?: string | null;
+  visualReferences?: string | null;
+  website?: string | null;
+  instagram?: string | null;
+  facebook?: string | null;
+  linkedin?: string | null;
+  googleMapsUrl?: string | null;
   queryHint: string | null;
   latLng: { latitude: number; longitude: number } | null;
   metaTitle: string | null;
   metaDescription: string | null;
   verifiedSources: VerifiedSource[];
+  fieldStatuses?: Record<string, VerificationStatus>;
+  limitations?: string[];
+  researchNotes?: string[];
   capturedAt: string;
 }
 
@@ -137,4 +166,5 @@ export interface AnalysisErrorPayload {
   message: string;
   collectedData?: CollectedResearchData;
 }
+
 

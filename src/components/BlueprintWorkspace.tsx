@@ -98,13 +98,18 @@ export function BlueprintWorkspace({
           </div>
 
           <a
-            href={companyProfile.socialLinks.googleMapsUrl}
+            href={companyProfile.socialLinks.googleMapsUrl || result.resolvedMapsUrl}
             target="_blank"
             rel="noopener noreferrer"
             className="btn-3d-secondary inline-flex items-center gap-2 rounded-full px-5 py-2.5 text-xs font-semibold text-slate-100 whitespace-nowrap shrink-0"
           >
             <MapPin className="h-3.5 w-3.5 text-cyan-300" />
-            <span>Abrir no Google Maps</span>
+            <span>
+              {(companyProfile.socialLinks.googleMapsUrl || '').includes('google.com/maps') ||
+              (companyProfile.socialLinks.googleMapsUrl || '').includes('goo.gl')
+                ? 'Abrir no Google Maps'
+                : 'Abrir Link Analisado'}
+            </span>
             <ExternalLink className="h-3.5 w-3.5 text-slate-400" />
           </a>
         </div>
@@ -116,13 +121,51 @@ export function BlueprintWorkspace({
               Dados de Contato e Operação
             </h3>
             <dl className="space-y-4 text-sm">
-              <div>
-                <dt className="text-xs text-slate-400">Endereço</dt>
+              {companyProfile.legalName && (
+                <div>
+                  <dt className="text-xs text-slate-400">
+                    Razão Social
+                    {companyProfile.fieldStatuses?.legalName === 'confirmed'
+                      ? ' · Confirmada'
+                      : companyProfile.fieldStatuses?.legalName === 'unconfirmed'
+                        ? ' · Não confirmada'
+                        : ''}
+                  </dt>
+                  <dd className="mt-1 text-slate-200 leading-relaxed">{companyProfile.legalName}</dd>
+                </div>
+              )}
+              {companyProfile.cnpj && (
+                <div className={companyProfile.legalName ? 'border-t border-slate-800/70 pt-3' : ''}>
+                  <dt className="text-xs text-slate-400">
+                    CNPJ
+                    {companyProfile.fieldStatuses?.cnpj === 'confirmed'
+                      ? ' · Confirmado'
+                      : companyProfile.fieldStatuses?.cnpj === 'unconfirmed'
+                        ? ' · Não confirmado'
+                        : ''}
+                  </dt>
+                  <dd className="mt-1 font-mono text-slate-200 tabular-nums">{companyProfile.cnpj}</dd>
+                </div>
+              )}
+              <div className={companyProfile.legalName || companyProfile.cnpj ? 'border-t border-slate-800/70 pt-3' : ''}>
+                <dt className="text-xs text-slate-400">
+                  Endereço
+                  {companyProfile.fieldStatuses?.address === 'confirmed'
+                    ? ' · Confirmado'
+                    : companyProfile.fieldStatuses?.address === 'unconfirmed'
+                      ? ' · Não confirmado'
+                      : ''}
+                </dt>
                 <dd className="mt-1 text-slate-200 leading-relaxed">{companyProfile.address}</dd>
               </div>
               <div className="border-t border-slate-800/70 pt-3">
                 <dt className="text-xs text-slate-400">Telefone / WhatsApp</dt>
-                <dd className="mt-1 font-mono text-slate-200 tabular-nums">{companyProfile.phone}</dd>
+                <dd className="mt-1 font-mono text-slate-200 tabular-nums">
+                  {companyProfile.phone}
+                  {companyProfile.whatsapp && !companyProfile.phone.includes(companyProfile.whatsapp)
+                    ? ` · WhatsApp ${companyProfile.whatsapp}`
+                    : ''}
+                </dd>
               </div>
               <div className="border-t border-slate-800/70 pt-3">
                 <dt className="text-xs text-slate-400">Horários de Funcionamento</dt>

@@ -23,16 +23,20 @@ import type {
 
 const EXAMPLE_LINKS = [
   {
-    label: 'MASP · Museu de Arte',
+    label: 'Site · MASP',
+    url: 'https://masp.org.br/',
+  },
+  {
+    label: 'CNPJ · Consulta Pública',
+    url: 'https://cnpj.biz/60664745000187',
+  },
+  {
+    label: 'Instagram · Empresa',
+    url: 'https://www.instagram.com/masp/',
+  },
+  {
+    label: 'Google Maps',
     url: 'https://www.google.com/maps/place/Museu+de+Arte+de+S%C3%A3o+Paulo+Assis+Chateaubriand/@-23.561414,-46.6558819,17z',
-  },
-  {
-    label: 'Mercado Municipal SP',
-    url: 'https://www.google.com/maps/place/Mercado+Municipal+de+S%C3%A3o+Paulo/@-23.541856,-46.629581,17z',
-  },
-  {
-    label: 'Padaria Bella Paulista',
-    url: 'https://www.google.com/maps/place/Padaria+Bella+Paulista/@-23.556795,-46.662612,17z',
   },
 ];
 
@@ -113,7 +117,7 @@ export default function App() {
       setErrorState({
         status: 400,
         code: 'INVALID_INPUT',
-        message: 'Cole um link do Google Maps para iniciar a análise.',
+        message: 'Cole qualquer link público da empresa para iniciar a identificação.',
       });
       inputRef.current?.focus();
       return;
@@ -124,14 +128,14 @@ export default function App() {
     setPhase('scanning');
     setStageInfo({
       stage: 'Conectando ao núcleo de pesquisa',
-      detail: 'Validando link do Google Maps e iniciando levantamento.',
+      detail: 'Validando link informado e iniciando identificação em fontes públicas.',
     });
 
     try {
       const response = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mapsUrl: trimmed }),
+        body: JSON.stringify({ url: trimmed, mapsUrl: trimmed }),
       });
 
       const contentType = response.headers.get('content-type') || '';
@@ -254,31 +258,31 @@ export default function App() {
             <div className="flex flex-col justify-center space-y-7 lg:col-span-7">
               <div className="space-y-4">
                 <p className="text-xs font-medium tracking-wider text-cyan-300">
-                  Pesquisa Real · Arquitetura 3D · Prompt Final de Construção
+                  Identificação Universal · Arquitetura 3D · Prompt Final de Construção
                 </p>
                 <h1 className="font-display text-4xl font-extrabold tracking-tight text-white [text-wrap:balance] sm:text-5xl">
-                  Transforme um link do Google Maps em arquitetura de aplicativo.
+                  COLE QUALQUER LINK DA EMPRESA
                 </h1>
                 <p className="max-w-2xl text-base leading-relaxed text-slate-300">
-                  Cole o link público da empresa. O VIRA SCANNER 3D investiga dados reais disponíveis na web, projeta os 11 pilares de UI/UX 3D e entrega o prompt único pronto para refinamento e construção.
+                  Instagram, Facebook, CNPJ, site, Google Maps ou qualquer outra página pública. O VIRA SCANNER 3D cruza fontes públicas reais, projeta os 11 pilares de UI/UX 3D e gera o prompt único pronto para construção.
                 </p>
               </div>
 
               <form onSubmit={handleSubmit} className="space-y-4">
-                <label htmlFor="google-maps-input" className="sr-only">
-                  Link do Google Maps da empresa
+                <label htmlFor="company-link-input" className="sr-only">
+                  Cole qualquer link da empresa
                 </label>
 
                 <div className="input-3d-recessed flex flex-col gap-3 rounded-3xl p-2.5 sm:flex-row sm:items-center">
                   <div className="flex flex-1 items-center gap-3 px-3">
                     <Link2 className="h-5 w-5 shrink-0 text-cyan-400" />
                     <input
-                      id="google-maps-input"
+                      id="company-link-input"
                       ref={inputRef}
                       type="url"
                       value={mapsUrl}
                       onChange={(e) => setMapsUrl(e.target.value)}
-                      placeholder="https://maps.app.goo.gl/... ou https://www.google.com/maps/place/..."
+                      placeholder="Instagram, Facebook, CNPJ, site, Google Maps ou outra página pública..."
                       disabled={phase === 'scanning'}
                       className="w-full bg-transparent py-2.5 text-sm text-white placeholder:text-slate-500 focus:outline-none disabled:opacity-60"
                     />
@@ -292,11 +296,11 @@ export default function App() {
                     {phase === 'scanning' ? (
                       <>
                         <Loader2 className="h-4 w-4 animate-spin" />
-                        <span>ANALISANDO...</span>
+                        <span>IDENTIFICANDO...</span>
                       </>
                     ) : (
                       <>
-                        <span>ANALISAR EMPRESA</span>
+                        <span>IDENTIFICAR EMPRESA</span>
                         <ArrowRight className="h-4 w-4" />
                       </>
                     )}
@@ -347,15 +351,25 @@ export default function App() {
                     {preservedData && (
                       <div className="rounded-2xl border border-white/10 bg-slate-950/65 p-3.5 text-xs text-slate-300 space-y-1.5">
                         <p className="font-semibold text-cyan-300">
-                          Dados preservados do Google Maps:
+                          Dados preservados das fontes consultadas:
                         </p>
                         <p>
                           <strong className="text-white">Estabelecimento:</strong>{' '}
-                          {preservedData.placeName || 'Identificado apenas pela URL'}
+                          {preservedData.placeName || preservedData.legalName || 'Identificado apenas pela URL'}
                         </p>
+                        {preservedData.cnpj && (
+                          <p className="font-mono tabular-nums">
+                            <strong className="font-sans text-white">CNPJ:</strong> {preservedData.cnpj}
+                          </p>
+                        )}
+                        {preservedData.address && (
+                          <p>
+                            <strong className="text-white">Endereço:</strong> {preservedData.address}
+                          </p>
+                        )}
                         {preservedData.metaDescription && (
                           <p>
-                            <strong className="text-white">Metadados públicos:</strong>{' '}
+                            <strong className="text-white">Resumo público:</strong>{' '}
                             {preservedData.metaDescription}
                           </p>
                         )}
