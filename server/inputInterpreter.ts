@@ -198,22 +198,28 @@ async function extractWithGeminiMultimodal(
 
   try {
     const base64 = file.buffer.toString('base64');
-    const resp = await geminiClient.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: {
-        parts: [
-          {
-            inlineData: {
-              mimeType: file.mimetype,
-              data: base64,
+    const timeoutPromise = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('Tempo limite da leitura visual opcional (12s).')), 12000)
+    );
+    const resp = await Promise.race([
+      geminiClient.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: {
+          parts: [
+            {
+              inlineData: {
+                mimeType: file.mimetype,
+                data: base64,
+              },
             },
-          },
-          {
-            text: 'Extraia fielmente todo texto e dados comerciais visíveis nesta imagem/documento (nome da empresa, razão social, CNPJ, endereço, telefone, WhatsApp, horários, site, Instagram, Facebook, produtos/serviços). Não invente nada que não esteja visível.',
-          },
-        ],
-      },
-    });
+            {
+              text: 'Extraia fielmente todo texto e dados comerciais visíveis nesta imagem/documento (nome da empresa, razão social, CNPJ, endereço, telefone, WhatsApp, horários, site, Instagram, Facebook, produtos/serviços). Não invente nada que não esteja visível.',
+            },
+          ],
+        },
+      }),
+      timeoutPromise,
+    ]);
     return { text: (resp.text || '').trim() || null, rateLimited: false };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -51,17 +51,50 @@ const EXAMPLE_INPUTS = [
 
 const MAX_CLIENT_FILES = 5;
 const MAX_CLIENT_FILE_BYTES = 5 * 1024 * 1024;
+const SESSION_STORAGE_KEY = 'vira_scanner_session_v1';
+
+interface PersistedSession {
+  materialText?: string;
+  activeResearchId?: string | null;
+  preservedData?: CollectedResearchData | null;
+  result?: ScannerBlueprintResult | null;
+  apiNotice?: AnalysisErrorPayload | null;
+}
+
+function readPersistedSession(): PersistedSession {
+  try {
+    const raw = window.localStorage.getItem(SESSION_STORAGE_KEY);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as PersistedSession;
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
 
 export default function App() {
-  const [materialText, setMaterialText] = useState('');
+  const initialSessionRef = useRef<PersistedSession | null>(null);
+  if (initialSessionRef.current === null) {
+    initialSessionRef.current = typeof window !== 'undefined' ? readPersistedSession() : {};
+  }
+  const initialSession = initialSessionRef.current;
+
+  const [materialText, setMaterialText] = useState(initialSession.materialText || '');
   const [attachments, setAttachments] = useState<AttachedMaterial[]>([]);
-  const [phase, setPhase] = useState<ScannerPhase>('idle');
+  const [phase, setPhase] = useState<ScannerPhase>(initialSession.result ? 'complete' : 'idle');
   const [stageInfo, setStageInfo] = useState<AnalysisStageEvent | null>(null);
   const [errorState, setErrorState] = useState<AnalysisErrorPayload | null>(null);
-  const [preservedData, setPreservedData] = useState<CollectedResearchData | null>(null);
-  const [result, setResult] = useState<ScannerBlueprintResult | null>(null);
+  const [apiNotice, setApiNotice] = useState<AnalysisErrorPayload | null>(initialSession.apiNotice || null);
+  const [activeResearchId, setActiveResearchId] = useState<string | null>(
+    initialSession.activeResearchId || initialSession.result?.meta?.researchId || null
+  );
+  const [preservedData, setPreservedData] = useState<CollectedResearchData | null>(
+    initialSession.preservedData || null
+  );
+  const [result, setResult] = useState<ScannerBlueprintResult | null>(initialSession.result || null);
   const [promptCopied, setPromptCopied] = useState(false);
   const [isGeneratingFallback, setIsGeneratingFallback] = useState(false);
+  const [isEnrichingOnly, setIsEnrichingOnly] = useState(false);
 
   const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -72,6 +105,36 @@ export default function App() {
   useEffect(() => {
     attachmentsRef.current = attachments;
   }, [attachments]);
+
+  useEffect(() => {
+    try {
+      const payload: PersistedSession = {
+        materialText,
+        activeResearchId,
+        preservedData,
+        result,
+        apiNotice,
+      };
+      window.localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify(payload));
+    } catch {
+      // Ignore storage quota errors silently
+    }
+  }, [materialText, activeResearchId, preservedData, result, apiNotice]);
+
+  useEffect(() => {
+    if (activeResearchId && !result) {
+      fetch(`/api/research/${encodeURIComponent(activeResearchId)}`)
+        .then((r) => (r.ok ? r.json() : null))
+        .then((rec) => {
+          if (rec?.collectedData) setPreservedData(rec.collectedData);
+          if (rec?.blueprint) {
+            setResult(rec.blueprint);
+            setPhase('complete');
+          }
+        })
+        .catch(() => undefined);
+    }
+  }, []);
 
   useEffect(() => {
     return () => {
@@ -177,14 +240,16 @@ export default function App() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          researchId: activeResearchId || undefined,
           collectedData: preservedData,
-          reason: errorState?.message,
+          reason: errorState?.message || apiNotice?.message,
         }),
       });
       const data = (await resp.json()) as ScannerBlueprintResult & { error?: string };
       if (!resp.ok || data.error) {
         throw new Error(data.error || 'Falha ao gerar o projeto com os dados disponíveis.');
       }
+      if (data.meta?.researchId) setActiveResearchId(data.meta.researchId);
       setResult(data);
       setPhase('complete');
       setErrorState(null);
@@ -200,6 +265,47 @@ export default function App() {
       });
     } finally {
       setIsGeneratingFallback(false);
+    }
+  };
+
+  const handleEnrichPreserved = async () => {
+    if ((!activeResearchId && !preservedData) || isEnrichingOnly) return;
+    setIsEnrichingOnly(true);
+    try {
+      const resp = await fetch('/api/enrich', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          researchId: activeResearchId || undefined,
+          collectedData: preservedData || undefined,
+        }),
+      });
+      const data = (await resp.json()) as {
+        enriched?: boolean;
+        result?: ScannerBlueprintResult;
+        notice?: AnalysisErrorPayload | null;
+        error?: string;
+      };
+      if (!resp.ok || !data.result) {
+        throw new Error(data.error || 'Falha ao tentar enriquecimento opcional.');
+      }
+      if (data.result.meta?.researchId) setActiveResearchId(data.result.meta.researchId);
+      setResult(data.result);
+      setPhase('complete');
+      setErrorState(null);
+      setApiNotice(data.enriched ? null : data.notice || null);
+    } catch (err) {
+      setApiNotice({
+        status: 503,
+        code: 'UPSTREAM_ERROR',
+        message:
+          err instanceof Error
+            ? err.message
+            : 'Serviço Gemini indisponível. O projeto local permanece salvo e completo.',
+        collectedData: preservedData || undefined,
+      });
+    } finally {
+      setIsEnrichingOnly(false);
     }
   };
 
@@ -220,6 +326,7 @@ export default function App() {
 
     isSubmittingRef.current = true;
     setErrorState(null);
+    setApiNotice(null);
     setPhase('scanning');
     setStageInfo({
       stage: 'Recebendo e classificando material',
@@ -272,6 +379,7 @@ export default function App() {
       let buffer = '';
       let receivedResult: ScannerBlueprintResult | null = null;
       let streamError: AnalysisErrorPayload | null = null;
+      let streamNotice: AnalysisErrorPayload | null = null;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -299,6 +407,17 @@ export default function App() {
 
           if (eventType === 'status') {
             setStageInfo(payload as AnalysisStageEvent);
+          } else if (eventType === 'collected') {
+            const colPayload = payload as {
+              researchId?: string;
+              collectedData?: CollectedResearchData;
+            };
+            if (colPayload.researchId) setActiveResearchId(colPayload.researchId);
+            if (colPayload.collectedData) setPreservedData(colPayload.collectedData);
+          } else if (eventType === 'notice') {
+            streamNotice = payload as AnalysisErrorPayload;
+            if (streamNotice.collectedData) setPreservedData(streamNotice.collectedData);
+            setApiNotice(streamNotice);
           } else if (eventType === 'error') {
             streamError = payload as AnalysisErrorPayload;
             if (streamError.collectedData) {
@@ -310,7 +429,7 @@ export default function App() {
         }
       }
 
-      if (streamError) {
+      if (streamError && !receivedResult) {
         setErrorState(streamError);
         setPhase(result ? 'complete' : 'idle');
         setStageInfo(null);
@@ -321,8 +440,15 @@ export default function App() {
         throw new Error('A identificação terminou sem retornar o projeto arquitetônico.');
       }
 
+      if (receivedResult.meta?.researchId) {
+        setActiveResearchId(receivedResult.meta.researchId);
+      }
+      if (receivedResult.meta?.apiNotice !== undefined) {
+        setApiNotice(receivedResult.meta.apiNotice);
+      } else if (!streamNotice) {
+        setApiNotice(null);
+      }
       setResult(receivedResult);
-      setPreservedData(null);
       setErrorState(null);
       setPhase('complete');
       setStageInfo(null);
@@ -331,6 +457,11 @@ export default function App() {
         resultsAnchorRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
       }, 140);
     } catch (err) {
+      // Se já coletamos dados antes da queda, gera localmente para nunca interromper o fluxo
+      if (preservedData) {
+        await handleGenerateFromAvailable();
+        return;
+      }
       setPhase(result ? 'complete' : 'idle');
       setStageInfo(null);
       setErrorState({
@@ -489,7 +620,59 @@ export default function App() {
                   </div>
                 )}
 
-                {/* Informative 429 / Error Recovery Panel */}
+                {/* Non-blocking 429 / Local Independence Notice Banner (project still completed!) */}
+                {apiNotice && !errorState && (
+                  <div
+                    role="status"
+                    className="rounded-3xl border border-amber-500/40 bg-amber-950/25 p-5 text-amber-100 space-y-4"
+                  >
+                    <div className="flex items-start gap-3">
+                      <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-300" />
+                      <div className="space-y-1 text-sm">
+                        <p className="font-semibold">
+                          {apiNotice.code === 'RATE_LIMITED'
+                            ? 'Limite Gemini (429 RESOURCE_EXHAUSTED) — Projeto concluído localmente com dados preservados'
+                            : 'Modo Local Independente — Projeto arquitetônico concluído sem dependência da API Gemini'}
+                        </p>
+                        <p className="text-xs leading-relaxed opacity-90">{apiNotice.message}</p>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-3">
+                      <button
+                        type="button"
+                        onClick={() => void handleEnrichPreserved()}
+                        disabled={isEnrichingOnly || phase === 'scanning'}
+                        className="btn-3d-secondary inline-flex cursor-pointer items-center gap-2 rounded-full px-4 py-2 text-xs font-semibold text-white whitespace-nowrap disabled:opacity-55"
+                      >
+                        {isEnrichingOnly ? (
+                          <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-300" />
+                        ) : (
+                          <RefreshCw className="h-3.5 w-3.5 text-cyan-300" />
+                        )}
+                        <span>Refinar com Gemini (sem repetir pesquisa)</span>
+                      </button>
+
+                      {preservedData && (
+                        <button
+                          type="button"
+                          onClick={() => void handleGenerateFromAvailable()}
+                          disabled={isGeneratingFallback || phase === 'scanning'}
+                          className="btn-3d-neon inline-flex cursor-pointer items-center gap-2 rounded-full px-5 py-2 text-xs font-bold whitespace-nowrap disabled:opacity-55"
+                        >
+                          {isGeneratingFallback ? (
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                          ) : (
+                            <Layers className="h-3.5 w-3.5" />
+                          )}
+                          <span>Regerar com Dados Preservados</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Informative 429 / Error Recovery Panel (fallback if pre-result transport error occurs) */}
                 {errorState && (
                   <div
                     role="alert"

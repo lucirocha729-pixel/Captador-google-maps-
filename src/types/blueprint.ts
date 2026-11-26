@@ -112,6 +112,13 @@ export interface AppArchitecture {
   };
 }
 
+export interface BlueprintGenerationMeta {
+  researchId: string;
+  generationMode: 'local' | 'local_fallback' | 'gemini_enriched';
+  reusedResearch: boolean;
+  apiNotice?: AnalysisErrorPayload | null;
+}
+
 export interface ScannerBlueprintResult {
   analyzedAt: string;
   originalInputUrl: string;
@@ -120,6 +127,7 @@ export interface ScannerBlueprintResult {
   architecture: AppArchitecture;
   executiveReportMarkdown: string;
   finalBuildPrompt: string;
+  meta?: BlueprintGenerationMeta;
 }
 
 export interface AnalysisStageEvent {
